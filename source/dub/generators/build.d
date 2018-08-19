@@ -114,9 +114,14 @@ class BuildGenerator : ProjectGenerator {
 	private bool buildTarget(GeneratorSettings settings, BuildSettings buildsettings, in Package pack, string config, in Package[] packages, in NativePath[] additional_dep_files, out NativePath target_path)
 	{
 		auto cwd = NativePath(getcwd());
-		bool generate_binary = !(buildsettings.options & BuildOption.syntaxOnly);
+		const generate_binary = !(buildsettings.options & BuildOption.syntaxOnly);
 
 		auto build_id = computeBuildID(config, buildsettings, settings);
+
+		if( buildsettings.preBuildCommands.length ){
+			logInfo("Running pre-build commands...");
+			runScanBuildCommands(buildsettings.preBuildCommands, pack, m_project, settings, buildsettings);
+		}
 
 		// make all paths relative to shrink the command line
 		string makeRelative(string path) { return shrinkPath(NativePath(path), cwd); }
@@ -176,15 +181,7 @@ class BuildGenerator : ProjectGenerator {
 			return false;
 		}
 
-		// determine basic build properties
-		auto generate_binary = !(buildsettings.options & BuildOption.syntaxOnly);
-
 		logInfo("%s %s: building configuration \"%s\"...", pack.name, pack.version_, config);
-
-		if( buildsettings.preBuildCommands.length ){
-			logInfo("Running pre-build commands...");
-			runBuildCommands(buildsettings.preBuildCommands, pack, m_project, settings, buildsettings);
-		}
 
 		// override target path
 		auto cbuildsettings = buildsettings;
@@ -243,11 +240,6 @@ class BuildGenerator : ProjectGenerator {
 		flags ~= buildsettings.dflags;
 		flags ~= mainsrc.relativeTo(cwd).toNativeString();
 
-		if (buildsettings.preBuildCommands.length){
-			logInfo("Running pre-build commands...");
-			runCommands(buildsettings.preBuildCommands);
-		}
-
 		logInfo("%s %s: building configuration \"%s\"...", pack.name, pack.version_, config);
 
 		logInfo("Running rdmd...");
@@ -301,11 +293,6 @@ class BuildGenerator : ProjectGenerator {
 				is_temp_target = true;
 			}
 			target_path = getTargetPath(buildsettings, settings);
-		}
-
-		if( buildsettings.preBuildCommands.length ){
-			logInfo("Running pre-build commands...");
-			runBuildCommands(buildsettings.preBuildCommands, pack, m_project, settings, buildsettings);
 		}
 
 		buildWithCompiler(settings, buildsettings);
@@ -550,6 +537,217 @@ class BuildGenerator : ProjectGenerator {
 		}
 		m_temporaryFiles = null;
 	}
+}
+
+
+/** Runs a list of build commands for a particular package and scan for "dub:" lines output
+
+	This function sets all DUB speficic environment variables and scan for
+	"dub:" lines output and amend build_settings with the settings passed from
+	the commands through these lines.
+
+	Each command get its environment updated by the settings of the previous commands
+*/
+private void runScanBuildCommands(in string[] commands, in Package pack, in Project proj,
+	in GeneratorSettings settings, ref BuildSettings build_settings)
+{
+	import std.process : Config, pipe, spawnShell, wait;
+	import std.stdio : File, stdin, stderr, stdout;
+
+	auto env = prepareCommandsEnvironment(pack, proj, settings, build_settings);
+
+	version(Windows) enum nullFile = "NUL";
+	else version(Posix) enum nullFile = "/dev/null";
+	else static assert(0);
+
+	// Do not use retainStdout here as the output reading loop would hang forever.
+	// Config.retainStderr is not necessary with stderr.
+	const config = Config.none;
+	const logLevel = getLogLevel();
+
+	auto childrenErr = logLevel >= LogLevel.none ? File(nullFile, "w") : stderr;
+
+	foreach (cmd; commands) {
+		logDiagnostic("Running %s", cmd);
+		auto p = pipe();
+		auto pid = spawnShell(cmd, stdin, p.writeEnd, childrenErr, env, config);
+
+		BuildSettings cmdBs;
+
+		foreach (l; p.readEnd.byLine) {
+			stdout.writeln(l);
+			enum dubLinePrefix = "dub:";
+			enum sdlSyntaxMarker = "sdl:";
+			enum jsonSyntaxMarker = "json:";
+			if (l.startsWith(dubLinePrefix)) {
+				auto content = l[dubLinePrefix.length .. $].idup;
+				if (content.startsWith(jsonSyntaxMarker)) {
+					content = content[jsonSyntaxMarker.length .. $];
+					parseJsonDubLine(cmdBs, content);
+				}
+				else if (content.startsWith(sdlSyntaxMarker)) {
+					content = content[sdlSyntaxMarker.length .. $];
+					parseSdlDubLine(cmdBs, content);
+				}
+				else {
+					try {
+						parseSdlDubLine(cmdBs, content);
+					}
+					catch (Exception ex) {
+						parseJsonDubLine(cmdBs, content);
+					}
+				}
+			}
+		}
+
+		build_settings.add(cmdBs);
+		amendBuildSettingsEnvironment(env, cmdBs);
+
+		const exitcode = wait(pid);
+		enforce(exitcode == 0, "Command failed with exit code "~to!string(exitcode));
+	}
+}
+
+// Throw on failure
+private void parseJsonDubLine(ref BuildSettings settings, string line)
+{
+	import dub.internal.vibecompat.core.log : logWarn;
+	import dub.internal.vibecompat.data.json : deserializeJson, parseJsonString;
+	import std.conv : to;
+	import std.format : format;
+	import std.meta : Filter;
+	import std.traits : EnumMembers;
+
+	alias BS = Filter!(isScannedBuildSetting, EnumMembers!BuildSetting);
+
+	static string buildSwitchCode() {
+		string code = "switch(name) {\n";
+		foreach (i, bs; BS) {
+			enum bsName = bs.to!string;
+			code ~= format(
+				"case \"%s\": settings.%s ~= deserializeJson!(string[])(value); break;\n",
+				bsName, bsName
+			);
+		}
+		code ~= "default: logWarn(\"Ignoring unexpected JSON property: %s\", name); break;";
+		return code ~ "}\n";
+	}
+
+	enum switchCode = buildSwitchCode();
+
+	auto json = parseJsonString(line);
+	foreach(string name, value; json) {
+		mixin(switchCode);
+	}
+}
+
+// Throw on failure
+private void parseSdlDubLine(ref BuildSettings settings, string line)
+{
+	import dub.internal.sdlang : parseSource;
+	import dub.internal.vibecompat.core.log : logWarn;
+	import std.conv : to;
+	import std.format : format;
+	import std.meta : Filter;
+	import std.traits : EnumMembers;
+
+	alias BS = Filter!(isScannedBuildSetting, EnumMembers!BuildSetting);
+
+	static string buildSwitchCode() {
+		string code = "switch(t.fullName) {\n";
+		foreach (i, bs; BS) {
+			enum bsName = bs.to!string;
+			code ~= format(
+				"case \"%s\": settings.%s ~= t.values.map!(v => v.get!string).array; break;\n",
+				bsName, bsName
+			);
+		}
+		code ~= "default: logWarn(\"Ignoring unexpected SDL property: %s\", t.fullName); break;";
+		return code ~ "}\n";
+	}
+
+	enum switchCode = buildSwitchCode();
+
+	auto tag = parseSource(line, null);
+	foreach(t; tag.all.tags) {
+		mixin(switchCode);
+	}
+}
+
+// Phobos isPowerOf2 is too recent for dub's compiler-compatibility
+/** Returns: whether x is a power of 2
+*/
+private bool isPowerOf2(in int x) pure @safe nothrow @nogc
+{
+	return x > 0 && !(x & (x - 1));
+}
+
+unittest {
+	assert(isPowerOf2(1));
+	assert(isPowerOf2(2));
+	assert(isPowerOf2(4));
+	assert(isPowerOf2(8));
+	assert(isPowerOf2(16));
+	assert(isPowerOf2(32));
+	assert(isPowerOf2(64));
+	assert(isPowerOf2(128));
+
+	assert(!isPowerOf2(0));
+	assert(!isPowerOf2(3));
+	assert(!isPowerOf2(36));
+	assert(!isPowerOf2(44));
+	assert(!isPowerOf2(75));
+}
+
+// std.meta.Filter requires this function to be public
+/** Returns: whether bs is a build setting that is scanned for output.
+*/
+bool isScannedBuildSetting(BuildSetting bs)()
+{
+	import std.algorithm : canFind;
+	immutable exclusion = [ BuildSetting.options ];
+	return isPowerOf2(cast(int)bs) && !exclusion.canFind(bs);
+}
+
+private void amendBuildSettingsEnvironment(ref string[string] env, in BuildSettings settings)
+{
+	import std.conv : to;
+	import std.meta : Filter;
+	import std.traits : EnumMembers;
+
+	alias BS = Filter!(isScannedBuildSetting, EnumMembers!BuildSetting);
+
+	foreach (bs; BS) {
+		enum bsName = bs.to!string;
+		enum envName = buildSettingEnvVarName(bsName);
+		const s = mixin("settings."~bsName);
+		if (s.length) {
+			env[envName] = join(s, " ");
+		}
+	}
+}
+
+private string buildSettingEnvVarName(in string propName) {
+	import std.uni : isUpper, toUpper;
+	string envName;
+	foreach (i, c; propName) {
+		if (c.isUpper && i != 0)
+			envName ~= "_";
+		envName ~= c.toUpper;
+	}
+	return /+ "DUB_" ~ +/ envName;
+}
+
+unittest {
+	assert(buildSettingEnvVarName("dflags") == "DFLAGS");
+	assert(buildSettingEnvVarName("lflags") == "LFLAGS");
+	assert(buildSettingEnvVarName("libs") == "LIBS");
+	assert(buildSettingEnvVarName("sourceFiles") == "SOURCE_FILES");
+	assert(buildSettingEnvVarName("copyFiles") == "COPY_FILES");
+	assert(buildSettingEnvVarName("versions") == "VERSIONS");
+	assert(buildSettingEnvVarName("debugVersions") == "DEBUG_VERSIONS");
+	assert(buildSettingEnvVarName("importPaths") == "IMPORT_PATHS");
+	assert(buildSettingEnvVarName("stringImportPaths") == "STRING_IMPORT_PATHS");
 }
 
 private NativePath getMainSourceFile(in Package prj)
