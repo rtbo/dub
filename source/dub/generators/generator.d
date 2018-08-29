@@ -616,9 +616,9 @@ private void finalizeGeneration(in Package pack, in Project proj, in GeneratorSe
 void runBuildCommands(in string[] commands, in Package pack, in Project proj,
 	in GeneratorSettings settings, in BuildSettings build_settings)
 {
-	import std.conv;
-	import std.process;
-	import dub.internal.utils;
+	import dub.internal.utils : getDUBExePath, runCommands;
+	import std.conv : to;
+	import std.process : environment, escapeShellFileName;
 
 	string[string] env = environment.toAA();
 	// TODO: do more elaborate things here
@@ -634,6 +634,7 @@ void runBuildCommands(in string[] commands, in Package pack, in Project proj,
 	env["DC_BASE"]               = settings.platform.compiler;
 	env["D_FRONTEND_VER"]        = to!string(settings.platform.frontendVersion);
 
+	env["DUB"]					 = escapeShellFileName(getDUBExePath());
 	env["DUB_PLATFORM"]          = join(cast(string[])settings.platform.platform," ");
 	env["DUB_ARCH"]              = join(cast(string[])settings.platform.architecture," ");
 

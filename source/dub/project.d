@@ -1203,8 +1203,10 @@ package(dub) immutable buildSettingsVars = [
 
 private string getVariable(Project, Package)(string name, in Project project, in Package pack, in GeneratorSettings gsettings)
 {
-	import std.process : environment;
+	import dub.internal.utils : getDUBExePath;
+	import std.process : environment, escapeShellFileName;
 	import std.uni : asUpperCase;
+
 	NativePath path;
 	if (name == "PACKAGE_DIR")
 		path = pack.path;
@@ -1226,6 +1228,10 @@ private string getVariable(Project, Package)(string name, in Project project, in
 		// no trailing slash for clean path concatenation (see #1392)
 		path.endsWithSlash = false;
 		return path.toNativeString();
+	}
+
+	if (name == "DUB") {
+		return escapeShellFileName(getDUBExePath());
 	}
 
 	if (name == "ARCH") {
