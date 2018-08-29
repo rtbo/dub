@@ -342,6 +342,39 @@ string getDUBVersion()
 	return verstr;
 }
 
+/// Returns: current executable's path if running as dub executable,
+/// or first dub executable found in $PATH if running as dub library.
+/// Throws: an Exception if nothing succeded.
+public string getDUBExePath()
+{
+	version(DubApplication) {
+		import std.file : thisExePath;
+		return thisExePath();
+	}
+	else {
+		// this must be dub as a library
+		import std.file : exists, isFile;
+		import std.path : buildPath, pathSplitter;
+		import std.process : environment;
+
+		version(Windows) {
+			enum exeName = "dub.exe";
+		}
+		else {
+			enum exeName = "dub";
+		}
+
+		foreach (p; pathSplitter(environment["PATH"])) {
+			const exe = buildPath(p, exeName);
+			if (exists(exe) && isFile(exe)) {
+				return exe;
+			}
+		}
+		throw new Exception("Could not find dub application in $PATH");
+	}
+}
+
+
 version(DubUseCurl) {
 	void setupHTTPClient(ref HTTP conn, uint timeout)
 	{
