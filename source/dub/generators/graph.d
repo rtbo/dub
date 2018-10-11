@@ -8,7 +8,10 @@ module dub.generators.graph;
 
 import dub.compilers.buildsettings;
 import dub.generators.generator;
+import dub.internal.vibecompat.core.log;
 import dub.project;
+
+import std.datetime.systime : SysTime;
 
 class BuildGraphGenerator : ProjectGenerator
 {
@@ -16,8 +19,12 @@ class BuildGraphGenerator : ProjectGenerator
 	private Node[string] m_nodes;
 	private Edge[] m_edges;
 
-	// the edges ready for process
-	private Edge[] m_readyEdges;
+	// linked list of edges ready for process
+	private Edge m_readyFirst;
+	private Edge m_readyLast;
+
+	// who many in total do we have to build
+	private int m_numToBuild;
 
 	this (Project project) {
 		super(project);
@@ -31,7 +38,9 @@ class BuildGraphGenerator : ProjectGenerator
 		// We clear state in case of.
 		m_nodes = null;
 		m_edges = null;
-		m_readyEdges = null;
+		m_readyFirst = null;
+		m_readyLast = null;
+		m_numToBuild = 0;
 
 		enforce(!settings.rdmd, "RDMD not supported for graph based builds");
 
@@ -72,6 +81,26 @@ class BuildGraphGenerator : ProjectGenerator
 		auto rootNode = buildTargetGraphRec(m_project.rootPackage.name);
 
 		// step 2: mark nodes that need to be rebuilt
+		if (rootNode.inEdge && markNode(rootNode)) {
+			import std.parallelism : totalCPUs;
+			// step 3: actual build
+			build(totalCPUs);
+		}
+		else {
+			logInfo("%s: Nothing to do.", m_project.rootPackage.name);
+		}
+	}
+
+	override void performPostGenerateActions(GeneratorSettings settings, in TargetInfo[string] targets)
+	{
+		import std.path : buildPath;
+
+		// run the generated executable
+		auto buildsettings = targets[m_project.rootPackage.name].buildSettings.dup;
+		if (settings.run && !(buildsettings.options & BuildOption.syntaxOnly)) {
+			const exeFile = buildPath(m_project.rootPackage.path.toNativeString(), getTargetPath(buildsettings, settings));
+			runTarget(exeFile, buildsettings, settings.runArgs, settings);
+		}
 	}
 
 	private void connect(Node[] inputs, Edge edge, Node[] outputs)
@@ -159,7 +188,7 @@ class BuildGraphGenerator : ProjectGenerator
 		const packPath = ti.pack.path.toString();
 		const cwd = buildNormalizedPath(getcwd());
 		const buildId = computeBuildID(ti.config, gs, bs);
-		const buildDir = buildNormalizedPath(packPath, ".dub", format("graph-%s", buildId));
+		const buildDir = buildNormalizedPath(packPath, ".dub", "build", format("graph-%s", buildId));
 
 		// shrink the command lines
 		foreach (ref f; bs.sourceFiles) f = shrinkPath(f, cwd);
@@ -210,11 +239,344 @@ class BuildGraphGenerator : ProjectGenerator
 		return linkNode;
 	}
 
+	private bool markNode(Node node)
+	{
+		assert(node.inEdge);
+		if (node.visited) return node.mustBuild;
+
+		bool mustBuild;
+		bool hasDepRebuild;
+
+		const mtime = node.timeLastBuild;
+
+		foreach (n; node.inEdge.inNodes)
+		{
+			const nmt = n.timeLastBuild;
+			if (nmt > mtime) {
+				mustBuild = true;
+			}
+			if (n.inEdge && markNode(n)) {
+				mustBuild = true;
+				hasDepRebuild = true;
+			}
+		}
+
+		if (mustBuild && !hasDepRebuild) {
+			addReady(node.inEdge);
+		}
+		if (mustBuild) {
+			m_numToBuild++;
+		}
+
+		node.visited = true;
+		node.mustBuild = mustBuild;
+		return mustBuild;
+	}
+
+	private void build(in uint maxJobs)
+	{
+		import core.time : dur;
+		import std.concurrency : receive, receiveTimeout;
+
+		uint jobs;
+
+		while (m_readyFirst) {
+
+			auto e = m_readyFirst;
+
+			while (e && jobs < maxJobs) {
+				if (!e.inProgress) {
+					jobs += e.jobs;
+					e.process();
+				}
+				e = e.readyNext;
+			}
+
+			void completion(EdgeCompletion ec)
+			{
+				import std.algorithm : any, all, filter;
+
+				auto edge = m_edges[ec.edgeInd];
+				jobs -= edge.jobs;
+				removeReady(edge);
+				edge.inProgress = false;
+				foreach (n; edge.outNodes) {
+					n.mustBuild = false;
+					foreach (oe; n.outEdges.filter!(e => e.outNodes.any!"a.mustBuild")) {
+						if (oe.inNodes.all!(i => !i.mustBuild)) {
+							addReady(oe);
+						}
+					}
+				}
+			}
+
+			void failure(EdgeFailure ef) {
+				throw new Exception("Edge failed");
+			}
+
+            // must wait for at least one job
+            receive(&completion, &failure);
+            // purge all that are already waiting
+            while(receiveTimeout(dur!"msecs"(-1), &completion, &failure)) {}
+		}
+	}
+
+    private void addReady(Edge edge)
+    {
+        assert (!isReady(edge));
+
+        if (!m_readyFirst) {
+            assert(!m_readyLast);
+            m_readyFirst = edge;
+            m_readyLast = edge;
+        }
+        else {
+            m_readyLast.readyNext = edge;
+            edge.readyPrev = m_readyLast;
+            m_readyLast = edge;
+        }
+    }
+
+    private bool isReady(Edge edge) {
+        auto e = m_readyFirst;
+        while (e) {
+            if (e is edge) {
+                return true;
+            }
+            e = e.readyNext;
+        }
+        return false;
+    }
+
+    private void removeReady(Edge edge)
+    {
+        assert(isReady(edge));
+
+        if (m_readyFirst is m_readyLast) {
+            assert(m_readyFirst is edge);
+            m_readyFirst = null;
+            m_readyLast = null;
+        }
+        else if (edge is m_readyFirst) {
+            m_readyFirst = edge.readyNext;
+            m_readyFirst.readyPrev = null;
+        }
+        else if (edge is m_readyLast) {
+            m_readyLast = edge.readyPrev;
+            m_readyLast.readyNext = null;
+        }
+        else {
+            auto prev = edge.readyPrev;
+            auto next = edge.readyNext;
+            prev.readyNext = next;
+            next.readyPrev = prev;
+        }
+        edge.readyNext = null;
+        edge.readyPrev = null;
+    }
+
+
 }
 
 
 private:
 
+// message structs
+
+struct EdgeCompletion
+{
+	size_t edgeInd;
+}
+
+struct EdgeFailure
+{
+	size_t edgeInd;
+}
+
+// graph types
+
+abstract class Node
+{
+	/// The graph owning this node.
+	BuildGraphGenerator graph;
+	/// The name of this node. Unique in the graph. Typically a file path.
+	string name;
+	/// The edge producing this node (null for source files).
+	Edge inEdge;
+	/// The edges that need this node as input.
+	Edge[] outEdges;
+
+	bool mustBuild;
+	bool visited;
+
+	this(BuildGraphGenerator graph, in string name) {
+		this.graph = graph;
+		this.name = name;
+		this.graph.m_nodes[name] = this;
+	}
+
+	abstract @property SysTime timeLastBuild();
+}
+
+/// A node associated with a physical file
+class FileNode : Node
+{
+	/// The modification timestamp of the file
+	SysTime mtime = SysTime.min;
+
+	this(BuildGraphGenerator graph, in string name) {
+		super(graph, name);
+	}
+
+	override @property SysTime timeLastBuild()
+	{
+		import std.file : timeLastModified;
+
+		return timeLastModified(name, SysTime.min);
+	}
+
+}
+
+/// A node not associated with a file.
+class PhonyNode : Node
+{
+	bool done;
+
+	this(BuildGraphGenerator graph, in string name)
+	{
+		super(graph, name);
+	}
+
+	override @property SysTime timeLastBuild()
+	{
+		return SysTime.min;
+	}
+}
+
+/// An edge is a link between nodes. In instance it represent a build
+/// operation that process input nodes to produce output nodes.
+class Edge
+{
+	BuildGraphGenerator graph;
+
+	Node[] inNodes;
+	Node[] outNodes;
+
+	// linked list of edges ready for process
+	Edge readyPrev;
+	Edge readyNext;
+
+	// ind within graph.m_edges
+	size_t ind;
+	// jobs consumed by this edge
+	uint jobs = 1;
+	// whether this edge is currently in progress
+	bool inProgress;
+
+	this (BuildGraphGenerator graph)
+	{
+		this.graph = graph;
+		this.ind = this.graph.m_edges.length;
+		this.graph.m_edges ~= this;
+	}
+
+	/// Process the edge in a new thread and signal the calling thread
+	/// either with EdgeCompletion or EdgeFailure message
+	abstract void process();
+}
+
+/// An edge which is processed by a command
+class CmdEdge : Edge
+{
+	const(string[]) cmd;
+
+	this (BuildGraphGenerator graph, in string[] cmd)
+	{
+		super(graph);
+		this.cmd = cmd;
+	}
+
+	override void process()
+	{
+		import dub.internal.utils : runCommand;
+		import std.concurrency : send, spawn, Tid, thisTid;
+		import std.process : escapeShellCommand;
+
+		inProgress = true;
+
+		spawn((Tid tid, size_t edgeInd, string cmd) {
+			try {
+				runCommand(cmd);
+				send(tid, EdgeCompletion(edgeInd));
+			}
+			catch (Exception ex) {
+				send(tid, EdgeFailure(edgeInd));
+			}
+		}, thisTid, ind, escapeShellCommand(cmd));
+	}
+
+}
+/// An edge which is processed by a shell command
+class ShellEdge : Edge
+{
+	string cmd;
+
+	this (BuildGraphGenerator graph, in string cmd)
+	{
+		super(graph);
+		this.cmd = cmd;
+	}
+
+	override void process()
+	{
+		import dub.internal.utils : runCommand;
+		import std.concurrency : send, spawn, Tid, thisTid;
+
+		inProgress = true;
+
+		spawn((Tid tid, size_t edgeInd, string cmd) {
+			try {
+				runCommand(cmd);
+				send(tid, EdgeCompletion(edgeInd));
+			}
+			catch (Exception ex) {
+				send(tid, EdgeFailure(edgeInd));
+			}
+		}, thisTid, ind, cmd);
+	}
+}
+
+/// An edge which is processed by the execution of a delegate
+class DgEdge : Edge
+{
+	void delegate() dg;
+
+	this (BuildGraphGenerator graph, void delegate() dg)
+	{
+		super(graph);
+		this.dg = dg;
+	}
+
+	override void process()
+	{
+		import std.concurrency : send, spawn, Tid, thisTid;
+
+		inProgress = true;
+
+		spawn((Tid tid, size_t edgeInd, shared(void delegate()) dg) {
+			try {
+				dg();
+				send(tid, EdgeCompletion(edgeInd));
+			}
+			catch (Exception ex) {
+				send(tid, EdgeFailure(edgeInd));
+			}
+		}, thisTid, ind, cast(shared(void delegate()))dg);
+	}
+}
+
+
+// helpers
 
 void delegate() unitCompileDg(in string src, in string obj, GeneratorSettings gs, BuildSettings bs)
 {
@@ -296,96 +658,46 @@ unittest {
 	assert(shrinkPath("/foo/bar/baz", "/bar/baz") == "/foo/bar/baz");
 }
 
-
-class Node
+void runTarget(string exePath, in BuildSettings buildsettings, string[] runArgs, GeneratorSettings settings)
 {
-	/// The graph owning this node.
-	BuildGraphGenerator graph;
-	/// The name of this node. Unique in the graph. Typically a file path.
-	string name;
-	/// The edge producing this node (null for source files).
-	Edge inEdge;
-	/// The edges that need this node as input.
-	Edge[] outEdges;
+	import std.algorithm : startsWith;
+	import std.array : join;
+	import std.conv : to;
+	import std.exception : enforce;
+	import std.file : chdir, getcwd;
+	import std.path : buildNormalizedPath, isAbsolute, relativePath;
+	import std.process : execute, spawnProcess, wait;
 
-	this(BuildGraphGenerator graph, in string name) {
-		this.graph = graph;
-		this.name = name;
-		this.graph.m_nodes[name] = this;
+	assert(buildsettings.targetType == TargetType.executable);
+
+	const cwd = getcwd();
+	string rund = cwd;
+	if (buildsettings.workingDirectory.length) {
+		rund = buildsettings.workingDirectory;
+		if (!rund.isAbsolute) rund = cwd ~ rund;
+		rund = buildNormalizedPath(rund);
+		logDiagnostic("Switching to %s", rund);
+		chdir(rund);
 	}
-}
+	scope(exit) chdir(cwd);
 
-/// A node associated with a physical file
-class FileNode : Node
-{
-	/// The modificationtimestamp of the file
-	long mtime;
-
-	this(BuildGraphGenerator graph, in string name) {
-		super(graph, name);
+	if (!exePath.isAbsolute) exePath = cwd ~ exePath;
+	exePath = buildNormalizedPath(exePath.relativePath(rund));
+	version (Posix) {
+		if (!exePath.startsWith(".") && !exePath.startsWith("/"))
+			exePath = "./" ~ exePath;
 	}
-}
-
-/// A node not associated with a file.
-class PhonyNode : Node
-{
-	this(BuildGraphGenerator graph, in string name)
-	{
-		super(graph, name);
+	version (Windows) {
+		if (!exePath.startsWith(".") && (exePath.length < 2 || exePath[1] != ':'))
+			exePath = ".\\" ~ exePath;
 	}
-}
-
-/// An edge is a link between nodes. In instance it represent a build
-/// operation that process input nodes to produce output nodes.
-class Edge
-{
-	BuildGraphGenerator graph;
-
-	Node[] inNodes;
-	Node[] outNodes;
-
-	this (BuildGraphGenerator graph)
-	{
-		this.graph = graph;
-		this.graph.m_edges ~= this;
-	}
-}
-
-/// An edge which is processed by a command
-class CmdEdge : Edge
-{
-	const(string[]) cmd;
-
-	this (BuildGraphGenerator graph, in string[] cmd)
-	{
-		super(graph);
-		this.cmd = cmd;
-	}
-
-
-}
-/// An edge which is processed by a shell command
-class ShellEdge : Edge
-{
-	string cmd;
-
-	this (BuildGraphGenerator graph, in string cmd)
-	{
-		super(graph);
-		this.cmd = cmd;
-	}
-
-
-}
-
-/// An edge which is processed by the execution of a delegate
-class DgEdge : Edge
-{
-	void delegate() dg;
-
-	this (BuildGraphGenerator graph, void delegate() dg)
-	{
-		super(graph);
-		this.dg = dg;
+	logInfo("Running %s %s", exePath, runArgs.join(" "));
+	if (settings.runCallback) {
+		auto res = execute(exePath ~ runArgs);
+		settings.runCallback(res.status, res.output);
+	} else {
+		auto pid = spawnProcess(exePath ~ runArgs);
+		auto result = pid.wait();
+		enforce(result == 0, "Program exited with code "~to!string(result));
 	}
 }
