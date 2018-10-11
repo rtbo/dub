@@ -469,6 +469,8 @@ enum BuildMode {
 */
 ProjectGenerator createProjectGenerator(string generator_type, Project project)
 {
+	import dub.generators.graph;
+
 	assert(project !is null, "Project instance needed to create a generator.");
 
 	generator_type = generator_type.toLower();
@@ -476,8 +478,14 @@ ProjectGenerator createProjectGenerator(string generator_type, Project project)
 		default:
 			throw new Exception("Unknown project generator: "~generator_type);
 		case "build":
-			logDebug("Creating build generator.");
-			return new BuildGenerator(project);
+			version (DubUseGraphBuild) {
+				logDebug("Creating graph build generator");
+				return new BuildGraphGenerator(project);
+			}
+			else {
+				logDebug("Creating build generator.");
+				return new BuildGenerator(project);
+			}
 		case "mono-d":
 			throw new Exception("The Mono-D generator has been removed. Use Mono-D's built in DUB support instead.");
 		case "visuald":

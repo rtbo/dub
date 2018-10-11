@@ -6,6 +6,8 @@
 */
 module dub.generators.graph;
 
+version (DubUseGraphBuild):
+
 import dub.compilers.buildsettings;
 import dub.generators.generator;
 import dub.internal.vibecompat.core.log;
