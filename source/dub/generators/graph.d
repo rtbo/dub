@@ -67,7 +67,7 @@ class BuildGraphGenerator : ProjectGenerator
 			auto bs = ti.buildSettings.dup;
 			foreach (ldep; ti.linkDependencies) {
 				if (bs.targetType != TargetType.staticLibrary && !(bs.options & BuildOption.syntaxOnly)) {
-					bs.addSourceFiles(targetPaths[ldep]);
+					//bs.addLinkerFiles(targetPaths[ldep]);
 				}
 			}
 
@@ -98,7 +98,10 @@ class BuildGraphGenerator : ProjectGenerator
 		// run the generated executable
 		auto buildsettings = targets[m_project.rootPackage.name].buildSettings.dup;
 		if (settings.run && !(buildsettings.options & BuildOption.syntaxOnly)) {
-			const exeFile = buildPath(m_project.rootPackage.path.toNativeString(), getTargetPath(buildsettings, settings));
+			const exeFile = buildPath(
+				m_project.rootPackage.path.toNativeString(),
+				getTargetPath(buildsettings, settings)
+			);
 			runTarget(exeFile, buildsettings, settings.runArgs, settings);
 		}
 	}
