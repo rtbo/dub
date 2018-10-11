@@ -275,10 +275,12 @@ class BuildGraphGenerator : ProjectGenerator
 
 	private void build(in uint maxJobs)
 	{
+		import std.algorithm : map;
 		import core.time : dur;
 		import std.concurrency : receive, receiveTimeout;
 
 		uint jobs;
+		int num=1;
 
 		while (m_readyFirst) {
 
@@ -287,6 +289,7 @@ class BuildGraphGenerator : ProjectGenerator
 			while (e && jobs < maxJobs) {
 				if (!e.inProgress) {
 					jobs += e.jobs;
+					logInfo("%s/%s building %s", num++, m_numToBuild, e.outNodes.map!"a.name");
 					e.process();
 				}
 				e = e.readyNext;
