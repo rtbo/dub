@@ -9,6 +9,7 @@ module dub.generators.graph;
 version (DubUseGraphBuild):
 
 import dub.compilers.buildsettings;
+import dub.compilers.compiler;
 import dub.generators.generator;
 import dub.internal.vibecompat.core.log;
 import dub.project;
@@ -69,7 +70,7 @@ class BuildGraphGenerator : ProjectGenerator
 			auto bs = ti.buildSettings.dup;
 			foreach (ldep; ti.linkDependencies) {
 				if (bs.targetType != TargetType.staticLibrary && !(bs.options & BuildOption.syntaxOnly)) {
-					//bs.addLinkerFiles(targetPaths[ldep]);
+					bs.addSourceFiles(targetPaths[ldep]);
 				}
 			}
 
@@ -203,12 +204,12 @@ class BuildGraphGenerator : ProjectGenerator
 		Node[] objNodes;
 		string[] objFiles;
 
-		foreach (f; bs.sourceFiles) {
+		foreach (f; bs.sourceFiles.filter!(f => !f.isLinkerFile())) {
 			const srcRel = relativePath(f, absolutePath(packPath, cwd));
 			const objPath = buildNormalizedPath(buildDir, srcRel)~".o";
 			auto src = new FileNode(this, f);
 			auto obj = new FileNode(this, objPath);
-			auto edge = new DgEdge(this, unitCompileDg(f, objPath, gs, bs));
+			auto edge = new CompilerInvocationEdge(this, unitCompile(f, objPath, gs, bs));
 			if (preBuildNode) {
 				connect([ preBuildNode, cast(Node)src ], edge, [ obj ]);
 			}
@@ -233,9 +234,9 @@ class BuildGraphGenerator : ProjectGenerator
 		gs.compiler.prepareBuildSettings(lbs, BuildSetting.commandLineSeparate|BuildSetting.sourceFiles);
 
 		auto linkNode = new FileNode(this, binPath);
-		auto linkEdge = new DgEdge(this, {
-			gs.compiler.invokeLinker(lbs, gs.platform, objFiles, gs.linkCallback);
-		});
+		auto linkEdge = new CompilerInvocationEdge(this,
+			gs.compiler.linkerInvocation(lbs, gs.platform, objFiles)
+		);
 
 		linkDeps ~= objNodes;
 		if (preBuildNode) linkDeps ~= preBuildNode;
@@ -383,7 +384,37 @@ class BuildGraphGenerator : ProjectGenerator
         edge.readyPrev = null;
     }
 
+	private void writeGraphviz(in string path)
+	{
+		import std.stdio : File;
 
+		auto f = File(path, "w");
+
+		f.writeln("digraph G {");
+
+		foreach (k, n; m_nodes) {
+
+			string shape = "";
+			if (!n.inEdge) {
+				shape = " [shape=box]";
+			}
+			else if (!n.outEdges.length) {
+				shape = " [shape=diamond]";
+			}
+
+			f.writefln(`    "%s"%s`, n.name, shape);
+		}
+
+		foreach (e; m_edges) {
+			foreach (i; e.inNodes) {
+				foreach (o; e.outNodes) {
+					f.writefln(`    "%s" -> "%s"`, o.name, i.name);
+				}
+			}
+		}
+
+		f.writeln("}");
+	}
 }
 
 
@@ -394,11 +425,14 @@ private:
 struct EdgeCompletion
 {
 	size_t edgeInd;
+	string output;
+	immutable(string)[] deps;
 }
 
 struct EdgeFailure
 {
 	size_t edgeInd;
+	string output;
 }
 
 // graph types
@@ -554,15 +588,15 @@ class ShellEdge : Edge
 	}
 }
 
-/// An edge which is processed by the execution of a delegate
-class DgEdge : Edge
+/// An edge which invokes a compiler
+class CompilerInvocationEdge : Edge
 {
-	void delegate() dg;
+	CompilerInvocation invocation;
 
-	this (BuildGraphGenerator graph, void delegate() dg)
+	this (BuildGraphGenerator graph, in CompilerInvocation invocation)
 	{
 		super(graph);
-		this.dg = dg;
+		this.invocation = invocation;
 	}
 
 	override void process()
@@ -571,22 +605,24 @@ class DgEdge : Edge
 
 		inProgress = true;
 
-		spawn((Tid tid, size_t edgeInd, shared(void delegate()) dg) {
+		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci) {
 			try {
-				dg();
-				send(tid, EdgeCompletion(edgeInd));
+				string output;
+				if (invoke(ci, output)) {
+					send (tid, EdgeCompletion(edgeInd));
+					return;
+				}
 			}
-			catch (Exception ex) {
-				send(tid, EdgeFailure(edgeInd));
-			}
-		}, thisTid, ind, cast(shared(void delegate()))dg);
+			catch (Exception ex) {}
+			send (tid, EdgeFailure(edgeInd));
+		}, thisTid, ind, invocation);
 	}
 }
 
 
 // helpers
 
-void delegate() unitCompileDg(in string src, in string obj, GeneratorSettings gs, BuildSettings bs)
+CompilerInvocation unitCompile(in string src, in string obj, GeneratorSettings gs, BuildSettings bs)
 {
 	bs.libs = null;
 	bs.lflags = null;
@@ -594,9 +630,7 @@ void delegate() unitCompileDg(in string src, in string obj, GeneratorSettings gs
 	bs.targetType = TargetType.object;
 	gs.compiler.prepareBuildSettings(bs, BuildSetting.commandLine);
 	gs.compiler.setTarget(bs, gs.platform, obj);
-	return () {
-		gs.compiler.invoke(bs, gs.platform, gs.compileCallback);
-	};
+	return gs.compiler.invocation(bs, gs.platform);
 }
 
 string computeBuildID(in string config, in ref GeneratorSettings gs, in ref BuildSettings bs)
