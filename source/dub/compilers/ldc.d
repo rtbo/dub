@@ -213,6 +213,16 @@ class LDCCompiler : Compiler {
 		return  lflags.map!(s => "-L="~s)().array();
 	}
 
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform)
+	{
+		return CompilerInvocation.init;
+	}
+
+	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects)
+	{
+		return CompilerInvocation.init;
+	}
+
 	private auto escapeArgs(in string[] args)
 	{
 		return args.map!(s => s.canFind(' ') ? "\""~s~"\"" : s);

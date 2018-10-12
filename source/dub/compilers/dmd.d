@@ -233,6 +233,32 @@ class DMDCompiler : Compiler {
 		return  lflags.map!(f => "-L"~f)().array();
 	}
 
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform)
+	{
+		import std.exception  : assumeUnique;
+
+		const(string)[] args = [ platform.compilerBinary ] ~ settings.dflags;
+		if (platform.frontendVersion >= 2066) args ~= "-vcolumns";
+
+		return CompilerInvocation( assumeUnique(args),  "@%s" );
+	}
+
+	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects)
+	{
+		import std.exception : assumeUnique;
+
+		auto tpath = NativePath(settings.targetPath) ~ getTargetFileName(settings, platform);
+		auto args = [ platform.compilerBinary, "-of"~tpath.toNativeString() ];
+		args ~= objects;
+		args ~= settings.sourceFiles;
+		version(linux) args ~= "-L--no-as-needed"; // avoids linker errors due to libraries being specified in the wrong order by DMD
+		args ~= lflagsToDFlags(settings.lflags);
+		args ~= settings.dflags.filter!(f => isLinkerDFlag(f)).array;
+
+		return CompilerInvocation( assumeUnique(args), "@%s" );
+	}
+
+
 	private auto escapeArgs(in string[] args)
 	{
 		return args.map!(s => s.canFind(' ') ? "\""~s~"\"" : s);

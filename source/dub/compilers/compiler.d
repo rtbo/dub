@@ -54,6 +54,23 @@ void registerCompiler(Compiler c)
 }
 
 
+/// Represent an invocation of a compiler
+/// with optional support for an argument file (aka RSP - response file).
+struct CompilerInvocation
+{
+	/// invocation arguments. args[0] is the compiler binary.
+	immutable(string)[] args;
+
+	/// null if rsp file is not supported or not desired, in such case the args
+	/// must be passed verbatim to the compiler, otherwise a format
+	/// containing "%s" as placeholder for a filename to be written
+	/// with args[1 .. $] as content (one arg per line)
+	string rspFormat;
+
+	/// a dependency file produced by the invocation
+	string depfile;
+}
+
 interface Compiler {
 	/// Returns the canonical name of the compiler (e.g. "dmd").
 	@property string name() const;
@@ -88,6 +105,12 @@ interface Compiler {
 
 	/// Convert linker flags to compiler format
 	string[] lflagsToDFlags(in string[] lflags) const;
+
+	/// Get arguments for a deferred invocation
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform);
+
+	/// Get arguments for a deferred linker invocation
+	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects);
 
 	/** Runs a tool and provides common boilerplate code.
 
@@ -150,6 +173,65 @@ interface Compiler {
 	}
 }
 
+/// Exception thrown by invoke when the compiler returns non-zero code
+class CompilerInvocationFailed : Exception
+{
+	/// invocation that returned non-zero
+	CompilerInvocation invocation;
+	/// compiler output (stdout and stderr)
+	string output;
+
+	this (CompilerInvocation invocation, string output)
+	{
+		this.invocation = invocation;
+		this.output = output;
+
+		super(
+			"Compiler invocation failed:\n" ~
+			invocation.args.join(" ") ~ "\n" ~
+			output
+		);
+	}
+}
+
+/// Perform the compiler invocation
+bool invoke(in CompilerInvocation ci, out string output)
+{
+	import dub.internal.utils : getTempFile;
+	import std.exception : enforce;
+	import std.file : remove, write;
+	import std.format : format;
+	import std.process : pipe, spawnProcess, wait;
+	import std.stdio : File, stdin;
+	import std.typecons : Yes;
+
+	string resFile;
+	const(string)[] args = ci.args;
+	if (ci.rspFormat.length) {
+		resFile = getTempFile("dub-build", ".rsp").toNativeString();
+		auto f = File(resFile, "w");
+		foreach (a; args[1 .. $]) {
+			f.writeln(a);
+		}
+		args = [ args[0], format(ci.rspFormat, resFile) ];
+	}
+
+	auto p = pipe();
+	auto pid = spawnProcess(args, stdin, p.writeEnd, p.writeEnd);
+	foreach (l; p.readEnd.byLineCopy(Yes.keepTerminator)) {
+		output ~= l;
+	}
+	const code = wait(pid);
+	if (resFile) remove(resFile);
+	return code == 0;
+}
+
 private {
 	Compiler[] s_compilers;
+
+	auto escapeArgs(in string[] args)
+	{
+		return args.map!(s => s.canFind(' ') ? "\""~s~"\"" : s);
+	}
 }
+

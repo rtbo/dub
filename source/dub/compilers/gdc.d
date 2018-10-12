@@ -225,6 +225,16 @@ class GDCCompiler : Compiler {
 
 		return  dflags;
 	}
+
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform)
+	{
+		return CompilerInvocation.init;
+	}
+
+	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects)
+	{
+		return CompilerInvocation.init;
+	}
 }
 
 private string extractTarget(const string[] args) { auto i = args.countUntil("-o"); return i >= 0 ? args[i+1] : null; }
