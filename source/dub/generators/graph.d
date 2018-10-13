@@ -151,9 +151,9 @@ class BuildGraphGenerator : ProjectGenerator
 
 		const packName = ti.pack.name;
 
-		foreach (i, pbc; bs.preBuildCommands) {
-			auto node = new PhonyNode(this, format("%s-prebuild-%s", ti.pack.name, i+1));
-			auto edge = new ShellEdge(this, packName, "pre-build command", pbc);
+		if (bs.preBuildCommands.length) {
+			auto node = new PhonyNode(this, format("%s-prebuild", ti.pack.name));
+			auto edge = new CmdsEdge(this, packName, "pre-build commands", bs.preBuildCommands.idup);
 			if (lastNode)
 				connect(lastNode, edge, node);
 			else
@@ -172,9 +172,9 @@ class BuildGraphGenerator : ProjectGenerator
 			lastNode = linkNode;
 		}
 
-		foreach (i, pbc; bs.postBuildCommands) {
-			auto node = new PhonyNode(this, format("%s-postbuild-%s", ti.pack.name, i+1));
-			auto edge = new ShellEdge(this, packName, "post-build command", pbc);
+		if (bs.postBuildCommands.length) {
+			auto node = new PhonyNode(this, format("%s-postbuild", ti.pack.name));
+			auto edge = new CmdsEdge(this, packName, "post-build commands", bs.postBuildCommands.idup);
 			if (lastNode)
 				connect(lastNode, edge, node);
 			else
@@ -592,65 +592,35 @@ class Edge
 	abstract void process();
 }
 
-/// An edge which is processed by a command
-class CmdEdge : Edge
+/// An edge which is processed by several shell commands
+class CmdsEdge : Edge
 {
-	const(string[]) cmd;
+	immutable(string)[] cmds;
 
-	this (BuildGraphGenerator graph, in string pack, in string desc, in string[] cmd)
+	this (BuildGraphGenerator graph, in string pack, in string desc, immutable(string)[] cmds)
 	{
 		super(graph, pack, desc);
-		this.cmd = cmd;
+		this.cmds = cmds;
 	}
 
 	override void process()
 	{
-		import dub.internal.utils : runCommand;
+		import dub.internal.utils : runCommands;
 		import std.concurrency : send, spawn, Tid, thisTid;
-		import std.process : escapeShellCommand;
 
 		inProgress = true;
 
-		spawn((Tid tid, size_t edgeInd, string cmd) {
+		spawn((Tid tid, size_t edgeInd, immutable(string)[] cmds) {
 			try {
-				runCommand(cmd);
+				runCommands(cmds);
 				send(tid, EdgeCompletion(edgeInd));
 			}
 			catch (Exception ex) {
 				send(tid, EdgeFailure(edgeInd));
 			}
-		}, thisTid, ind, escapeShellCommand(cmd));
+		}, thisTid, ind, cmds);
 	}
 
-}
-/// An edge which is processed by a shell command
-class ShellEdge : Edge
-{
-	string cmd;
-
-	this (BuildGraphGenerator graph, in string pack, in string desc, in string cmd)
-	{
-		super(graph, pack, desc);
-		this.cmd = cmd;
-	}
-
-	override void process()
-	{
-		import dub.internal.utils : runCommand;
-		import std.concurrency : send, spawn, Tid, thisTid;
-
-		inProgress = true;
-
-		spawn((Tid tid, size_t edgeInd, string cmd) {
-			try {
-				runCommand(cmd);
-				send(tid, EdgeCompletion(edgeInd));
-			}
-			catch (Exception ex) {
-				send(tid, EdgeFailure(edgeInd));
-			}
-		}, thisTid, ind, cmd);
-	}
 }
 
 /// An edge which invokes a compiler
