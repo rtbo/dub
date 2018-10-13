@@ -29,7 +29,6 @@ class BuildGraphGenerator : ProjectGenerator
 	// a few stats for printing progress
 	private uint m_numToBuild;
 	private uint m_longestPackName;
-	private uint m_longestDesc;
 
 	this (Project project) {
 		super(project);
@@ -299,7 +298,7 @@ class BuildGraphGenerator : ProjectGenerator
 		int numLen(in int num) {
 			auto cmp = 10;
 			auto res = 1;
-			while (cmp < num) {
+			while (cmp <= num) {
 				cmp *= 10;
 				res += 1;
 			}
@@ -314,23 +313,27 @@ class BuildGraphGenerator : ProjectGenerator
 			import std.array : replicate;
 			return replicate(" ", numSpaces);
 		}
-
+		size_t previousLen;
 		void printProgress(in string packName, in string desc)
 		{
 			import std.format : format;
-			import std.stdio : writef;
+			import std.stdio : stdout;
 
 			if (getLogLevel() < LogLevel.info) return;
 			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
 			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
 			const progStr = format(
 				"[ %s/%s %s ] %s%s", numStr, m_numToBuild, packStr, desc,
-				spaces(m_longestDesc - desc.length)
+				spaces(previousLen < desc.length ? 0 : previousLen - desc.length)
 			);
-			writef("%s\r", progStr);
+			previousLen = desc.length;
+			stdout.writef("\r%s", progStr);
+			stdout.flush();
 		}
 
 		uint jobs;
+
+		scope(exit) logInfo(""); // log new line
 
 		while (m_readyFirst) {
 
@@ -577,14 +580,11 @@ class Edge
 
 	this (BuildGraphGenerator graph, in string pack, in string desc)
 	{
-		import std.algorithm : max;
-
 		this.graph = graph;
 		this.pack = pack;
 		this.desc = desc;
 		this.ind = this.graph.m_edges.length;
 		this.graph.m_edges ~= this;
-		this.graph.m_longestDesc = max(this.graph.m_longestDesc, cast(uint)desc.length);
 	}
 
 	/// Process the edge in a new thread and signal the calling thread
