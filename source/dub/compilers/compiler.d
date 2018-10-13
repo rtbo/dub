@@ -195,7 +195,7 @@ class CompilerInvocationFailed : Exception
 }
 
 /// Perform the compiler invocation
-bool invoke(in CompilerInvocation ci, out string output)
+bool invoke(in CompilerInvocation ci, out int code, out string output)
 {
 	import dub.internal.utils : getTempFile;
 	import std.exception : enforce;
@@ -221,7 +221,7 @@ bool invoke(in CompilerInvocation ci, out string output)
 	foreach (l; p.readEnd.byLineCopy(Yes.keepTerminator)) {
 		output ~= l;
 	}
-	const code = wait(pid);
+	code = wait(pid);
 	if (resFile) remove(resFile);
 	return code == 0;
 }
