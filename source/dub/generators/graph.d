@@ -26,8 +26,10 @@ class BuildGraphGenerator : ProjectGenerator
 	private Edge m_readyFirst;
 	private Edge m_readyLast;
 
-	// who many in total do we have to build
-	private int m_numToBuild;
+	// a few stats for printing progress
+	private uint m_numToBuild;
+	private uint m_longestPackName;
+	private uint m_longestDesc;
 
 	this (Project project) {
 		super(project);
@@ -35,6 +37,7 @@ class BuildGraphGenerator : ProjectGenerator
 
 	override void generateTargets(GeneratorSettings settings, in TargetInfo[string] targets)
 	{
+		import std.algorithm : max;
 		import std.exception : enforce;
 
 		// Can a generator be used multiple times?
@@ -56,6 +59,8 @@ class BuildGraphGenerator : ProjectGenerator
 		{
 			auto pn = target in targetNodes;
 			if (pn) return *pn;
+
+			m_longestPackName = max(m_longestPackName, cast(uint)target.length);
 
 			const ti = targets[target];
 
@@ -144,9 +149,11 @@ class BuildGraphGenerator : ProjectGenerator
 		Node lastNode;
 		Node linkNode;
 
+		const packName = ti.pack.name;
+
 		foreach (i, pbc; bs.preBuildCommands) {
 			auto node = new PhonyNode(this, format("%s-prebuild-%s", ti.pack.name, i+1));
-			auto edge = new ShellEdge(this, pbc);
+			auto edge = new ShellEdge(this, packName, "pre-build command", pbc);
 			if (lastNode)
 				connect(lastNode, edge, node);
 			else
@@ -167,7 +174,7 @@ class BuildGraphGenerator : ProjectGenerator
 
 		foreach (i, pbc; bs.postBuildCommands) {
 			auto node = new PhonyNode(this, format("%s-postbuild-%s", ti.pack.name, i+1));
-			auto edge = new ShellEdge(this, pbc);
+			auto edge = new ShellEdge(this, packName, "post-build command", pbc);
 			if (lastNode)
 				connect(lastNode, edge, node);
 			else
@@ -181,16 +188,17 @@ class BuildGraphGenerator : ProjectGenerator
 		return linkNode ? linkNode : lastNode;
 	}
 
-	private Node buildBinaryTargetGraph(in ref TargetInfo ti, ref GeneratorSettings gs, BuildSettings bs,
-			Node preBuildNode, Node[] linkDeps, out string binPath)
+	private Node buildBinaryTargetGraph(in ref TargetInfo ti, ref GeneratorSettings gs,
+			BuildSettings bs, Node preBuildNode, Node[] linkDeps, out string binPath)
 	{
 		import dub.compilers.utils : isLinkerFile;
 		import std.array : array;
 		import std.algorithm : filter;
 		import std.file : getcwd;
 		import std.format : format;
-		import std.path : absolutePath, buildNormalizedPath, relativePath;
+		import std.path : absolutePath, baseName, buildNormalizedPath, relativePath;
 
+		const packName =  ti.pack.name;
 		const packPath = ti.pack.path.toString();
 		const cwd = buildNormalizedPath(getcwd());
 		const buildId = computeBuildID(ti.config, gs, bs);
@@ -209,7 +217,10 @@ class BuildGraphGenerator : ProjectGenerator
 			const objPath = buildNormalizedPath(buildDir, srcRel)~".o";
 			auto src = new FileNode(this, f);
 			auto obj = new FileNode(this, objPath);
-			auto edge = new CompilerInvocationEdge(this, unitCompile(f, objPath, gs, bs));
+			auto edge = new CompilerInvocationEdge(
+				this, packName, "compiling "~baseName(f),
+				unitCompile(f, objPath, gs, bs)
+			);
 			if (preBuildNode) {
 				connect([ preBuildNode, cast(Node)src ], edge, [ obj ]);
 			}
@@ -234,7 +245,8 @@ class BuildGraphGenerator : ProjectGenerator
 		gs.compiler.prepareBuildSettings(lbs, BuildSetting.commandLineSeparate|BuildSetting.sourceFiles);
 
 		auto linkNode = new FileNode(this, binPath);
-		auto linkEdge = new CompilerInvocationEdge(this,
+		auto linkEdge = new CompilerInvocationEdge(
+			this, packName, "linking "~baseName(binPath),
 			gs.compiler.linkerInvocation(lbs, gs.platform, objFiles)
 		);
 
@@ -281,12 +293,44 @@ class BuildGraphGenerator : ProjectGenerator
 
 	private void build(in uint maxJobs)
 	{
-		import std.algorithm : map;
 		import core.time : dur;
 		import std.concurrency : receive, receiveTimeout;
 
-		uint jobs;
+		int numLen(in int num) {
+			auto cmp = 10;
+			auto res = 1;
+			while (cmp < num) {
+				cmp *= 10;
+				res += 1;
+			}
+			return res;
+		}
+
+		const maxLen = numLen(m_numToBuild);
 		int num=1;
+
+		string spaces(in size_t numSpaces)
+		{
+			import std.array : replicate;
+			return replicate(" ", numSpaces);
+		}
+
+		void printProgress(in string packName, in string desc)
+		{
+			import std.format : format;
+			import std.stdio : writef;
+
+			if (getLogLevel() < LogLevel.info) return;
+			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
+			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
+			const progStr = format(
+				"[ %s/%s %s ] %s%s", numStr, m_numToBuild, packStr, desc,
+				spaces(m_longestDesc - desc.length)
+			);
+			writef("%s\r", progStr);
+		}
+
+		uint jobs;
 
 		while (m_readyFirst) {
 
@@ -295,7 +339,7 @@ class BuildGraphGenerator : ProjectGenerator
 			while (e && jobs < maxJobs) {
 				if (!e.inProgress) {
 					jobs += e.jobs;
-					logInfo("%s/%s building %s", num++, m_numToBuild, e.outNodes.map!"a.name");
+					printProgress(e.pack, e.desc);
 					e.process();
 				}
 				e = e.readyNext;
@@ -390,7 +434,8 @@ class BuildGraphGenerator : ProjectGenerator
 
 		auto f = File(path, "w");
 
-		f.writeln("digraph G {");
+		f.writeln("digraph Dub {");
+		f.writeln(" rankdir=\"LR\"");
 
 		foreach (k, n; m_nodes) {
 
@@ -437,10 +482,20 @@ struct EdgeFailure
 
 // graph types
 
+// the state tag for a node
+struct StateTag
+{
+	bool exist;
+	SysTime mtime;
+
+}
+
 abstract class Node
 {
 	/// The graph owning this node.
 	BuildGraphGenerator graph;
+	/// The name of the package this node is part of
+	string pack;
 	/// The name of this node. Unique in the graph. Typically a file path.
 	string name;
 	/// The edge producing this node (null for source files).
@@ -501,6 +556,11 @@ class Edge
 {
 	BuildGraphGenerator graph;
 
+	/// The name of the package this edge is part of
+	string pack;
+	/// A description for the edge
+	string desc;
+
 	Node[] inNodes;
 	Node[] outNodes;
 
@@ -515,11 +575,16 @@ class Edge
 	// whether this edge is currently in progress
 	bool inProgress;
 
-	this (BuildGraphGenerator graph)
+	this (BuildGraphGenerator graph, in string pack, in string desc)
 	{
+		import std.algorithm : max;
+
 		this.graph = graph;
+		this.pack = pack;
+		this.desc = desc;
 		this.ind = this.graph.m_edges.length;
 		this.graph.m_edges ~= this;
+		this.graph.m_longestDesc = max(this.graph.m_longestDesc, cast(uint)desc.length);
 	}
 
 	/// Process the edge in a new thread and signal the calling thread
@@ -532,9 +597,9 @@ class CmdEdge : Edge
 {
 	const(string[]) cmd;
 
-	this (BuildGraphGenerator graph, in string[] cmd)
+	this (BuildGraphGenerator graph, in string pack, in string desc, in string[] cmd)
 	{
-		super(graph);
+		super(graph, pack, desc);
 		this.cmd = cmd;
 	}
 
@@ -563,9 +628,9 @@ class ShellEdge : Edge
 {
 	string cmd;
 
-	this (BuildGraphGenerator graph, in string cmd)
+	this (BuildGraphGenerator graph, in string pack, in string desc, in string cmd)
 	{
-		super(graph);
+		super(graph, pack, desc);
 		this.cmd = cmd;
 	}
 
@@ -593,9 +658,9 @@ class CompilerInvocationEdge : Edge
 {
 	CompilerInvocation invocation;
 
-	this (BuildGraphGenerator graph, in CompilerInvocation invocation)
+	this (BuildGraphGenerator graph, in string pack, in string desc, in CompilerInvocation invocation)
 	{
-		super(graph);
+		super(graph, pack, desc);
 		this.invocation = invocation;
 	}
 
