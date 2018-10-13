@@ -12,6 +12,7 @@ import dub.compilers.buildsettings;
 import dub.compilers.compiler;
 import dub.generators.generator;
 import dub.internal.vibecompat.core.log;
+import dub.package_;
 import dub.project;
 
 import std.datetime.systime : SysTime;
@@ -21,6 +22,10 @@ class BuildGraphGenerator : ProjectGenerator
 	// the whole graph nodes and edges
 	private Node[string] m_nodes;
 	private Edge[] m_edges;
+
+	// postbuild command nodes
+	private Node[string] m_preBuildNodes;
+	private Node[string] m_postBuildNodes;
 
 	// linked list of edges ready for process
 	private Edge m_readyFirst;
@@ -82,6 +87,7 @@ class BuildGraphGenerator : ProjectGenerator
 			auto node = buildTargetGraph(ti, settings, bs, depNodes, binPath);
 			targetPaths[target] = binPath;
 			targetNodes[target] = node;
+			node.isTarget = true;
 			return node;
 		}
 
@@ -151,8 +157,9 @@ class BuildGraphGenerator : ProjectGenerator
 		const packName = ti.pack.name;
 
 		if (bs.preBuildCommands.length) {
-			auto node = new PhonyNode(this, format("%s-prebuild", ti.pack.name));
-			auto edge = new CmdsEdge(this, packName, "pre-build commands", bs.preBuildCommands.idup);
+			auto node = new PhonyNode(this, packName, format("%s-prebuild", ti.pack.name));
+			auto edge = new CmdsEdge(this, ti.pack, gs, bs, "pre-build commands", bs.preBuildCommands.idup);
+			m_preBuildNodes[packName] = node;
 			if (lastNode)
 				connect(lastNode, edge, node);
 			else
@@ -172,8 +179,9 @@ class BuildGraphGenerator : ProjectGenerator
 		}
 
 		if (bs.postBuildCommands.length) {
-			auto node = new PhonyNode(this, format("%s-postbuild", ti.pack.name));
-			auto edge = new CmdsEdge(this, packName, "post-build commands", bs.postBuildCommands.idup);
+			auto node = new PhonyNode(this, packName, format("%s-postbuild", ti.pack.name));
+			auto edge = new CmdsEdge(this, ti.pack, gs, bs, "post-build commands", bs.postBuildCommands.idup);
+			m_postBuildNodes[packName] = node;
 			if (lastNode)
 				connect(lastNode, edge, node);
 			else
@@ -214,12 +222,10 @@ class BuildGraphGenerator : ProjectGenerator
 		foreach (f; bs.sourceFiles.filter!(f => !f.isLinkerFile())) {
 			const srcRel = relativePath(f, absolutePath(packPath, cwd));
 			const objPath = buildNormalizedPath(buildDir, srcRel)~".o";
-			auto src = new FileNode(this, f);
-			auto obj = new FileNode(this, objPath);
-			auto edge = new CompilerInvocationEdge(
-				this, packName, "compiling "~baseName(f),
-				unitCompile(f, objPath, gs, bs)
-			);
+			auto src = new FileNode(this, packName, f);
+			auto obj = new FileNode(this, packName, objPath);
+			auto edge = new CompileEdge(this, ti.pack, gs, bs,
+					"compiling "~baseName(f), f, objPath);
 			if (preBuildNode) {
 				connect([ preBuildNode, cast(Node)src ], edge, [ obj ]);
 			}
@@ -235,19 +241,9 @@ class BuildGraphGenerator : ProjectGenerator
 			packPath, bs.targetPath,
 			gs.compiler.getTargetFileName(bs, gs.platform)
 		);
-		const isStaticLib = bs.targetType == TargetType.staticLibrary ||
-				bs.targetType == TargetType.library;
 
-		BuildSettings lbs = bs;
-		lbs.sourceFiles = isStaticLib ? [] : bs.sourceFiles.filter!(f => f.isLinkerFile()).array;
-		gs.compiler.setTarget(lbs, gs.platform);
-		gs.compiler.prepareBuildSettings(lbs, BuildSetting.commandLineSeparate|BuildSetting.sourceFiles);
-
-		auto linkNode = new FileNode(this, binPath);
-		auto linkEdge = new CompilerInvocationEdge(
-			this, packName, "linking "~baseName(binPath),
-			gs.compiler.linkerInvocation(lbs, gs.platform, objFiles)
-		);
+		auto linkNode = new FileNode(this, packName, binPath);
+		auto linkEdge = new LinkEdge(this, ti.pack, gs, bs, "linking "~baseName(binPath), objFiles, binPath);
 
 		linkDeps ~= objNodes;
 		if (preBuildNode) linkDeps ~= preBuildNode;
@@ -258,6 +254,8 @@ class BuildGraphGenerator : ProjectGenerator
 
 	private bool markNode(Node node)
 	{
+		import std.path : baseName;
+
 		assert(node.inEdge);
 		if (node.visited) return node.mustBuild;
 
@@ -275,6 +273,26 @@ class BuildGraphGenerator : ProjectGenerator
 			if (n.inEdge && markNode(n)) {
 				mustBuild = true;
 				hasDepRebuild = true;
+			}
+		}
+
+		// activate pre-build and post-build if necessary
+		if (mustBuild && node.isTarget) {
+			auto preB = node.pack in m_preBuildNodes;
+			auto postB = node.pack in m_postBuildNodes;
+
+			if (preB) {
+				preB.mustBuild = true;
+				addReady(preB.inEdge);
+				foreach (e; preB.outEdges) {
+					if (isReady(e)) {
+						removeReady(e);
+					}
+				}
+				hasDepRebuild = true;
+			}
+			if (postB) {
+				postB.mustBuild = true;
 			}
 		}
 
@@ -322,13 +340,10 @@ class BuildGraphGenerator : ProjectGenerator
 			if (getLogLevel() < LogLevel.info) return;
 			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
 			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
-			const progStr = format(
-				"[ %s/%s %s ] %s%s", numStr, m_numToBuild, packStr, desc,
-				spaces(previousLen < desc.length ? 0 : previousLen - desc.length)
-			);
-			previousLen = desc.length;
-			stdout.writef("\r%s", progStr);
+			stdout.writef("[ %s/%s %s ] %s%s\n", numStr, m_numToBuild, packStr, desc,
+				spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
 			stdout.flush();
+			previousLen = desc.length;
 		}
 
 		uint jobs;
@@ -342,7 +357,7 @@ class BuildGraphGenerator : ProjectGenerator
 			while (e && jobs < maxJobs) {
 				if (!e.inProgress) {
 					jobs += e.jobs;
-					printProgress(e.pack, e.desc);
+					printProgress(e.pack.name, e.desc);
 					e.process();
 				}
 				e = e.readyNext;
@@ -367,7 +382,8 @@ class BuildGraphGenerator : ProjectGenerator
 			}
 
 			void failure(EdgeFailure ef) {
-				throw new Exception("Edge failed");
+				auto edge = m_edges[ef.edgeInd];
+				throw new BuildFailedException(edge.desc, ef.cmd, ef.output, ef.code);
 			}
 
             // must wait for at least one job
@@ -394,14 +410,7 @@ class BuildGraphGenerator : ProjectGenerator
     }
 
     private bool isReady(Edge edge) {
-        auto e = m_readyFirst;
-        while (e) {
-            if (e is edge) {
-                return true;
-            }
-            e = e.readyNext;
-        }
-        return false;
+		return edge is m_readyFirst || edge.readyPrev !is null || edge.readyNext !is null;
     }
 
     private void removeReady(Edge edge)
@@ -465,6 +474,37 @@ class BuildGraphGenerator : ProjectGenerator
 	}
 }
 
+/// Exception thrown when a build fails to complete
+class BuildFailedException : Exception
+{
+    string desc;
+    string cmd;
+    string output;
+    int code;
+
+    private this (string desc, string cmd, string output, int code)
+    {
+        import std.conv : to;
+
+        this.desc = desc;
+        this.cmd = cmd;
+        this.output = output;
+        this.code = code;
+
+        string msg = "\n" ~ desc ~ " failed";
+        if (code) msg ~= " with code " ~ code.to!string;
+        msg ~= ":\n";
+
+        if (cmd.length) {
+            msg ~= cmd ~ "\n";
+        }
+        if (output.length) {
+            msg ~= output ~ "\n";
+        }
+
+        super( msg );
+    }
+}
 
 private:
 
@@ -480,18 +520,12 @@ struct EdgeCompletion
 struct EdgeFailure
 {
 	size_t edgeInd;
+	int code;
+	string cmd;
 	string output;
 }
 
 // graph types
-
-// the state tag for a node
-struct StateTag
-{
-	bool exist;
-	SysTime mtime;
-
-}
 
 abstract class Node
 {
@@ -501,6 +535,8 @@ abstract class Node
 	string pack;
 	/// The name of this node. Unique in the graph. Typically a file path.
 	string name;
+	/// whether this node is a target node
+	bool isTarget;
 	/// The edge producing this node (null for source files).
 	Edge inEdge;
 	/// The edges that need this node as input.
@@ -509,8 +545,9 @@ abstract class Node
 	bool mustBuild;
 	bool visited;
 
-	this(BuildGraphGenerator graph, in string name) {
+	this(BuildGraphGenerator graph, in string pack, in string name) {
 		this.graph = graph;
+		this.pack = pack;
 		this.name = name;
 		this.graph.m_nodes[name] = this;
 	}
@@ -524,8 +561,8 @@ class FileNode : Node
 	/// The modification timestamp of the file
 	SysTime mtime = SysTime.min;
 
-	this(BuildGraphGenerator graph, in string name) {
-		super(graph, name);
+	this(BuildGraphGenerator graph, in string pack, in string name) {
+		super(graph, pack, name);
 	}
 
 	override @property SysTime timeLastBuild()
@@ -542,9 +579,9 @@ class PhonyNode : Node
 {
 	bool done;
 
-	this(BuildGraphGenerator graph, in string name)
+	this(BuildGraphGenerator graph, in string pack, in string name)
 	{
-		super(graph, name);
+		super(graph, pack, name);
 	}
 
 	override @property SysTime timeLastBuild()
@@ -557,10 +594,14 @@ class PhonyNode : Node
 /// operation that process input nodes to produce output nodes.
 class Edge
 {
+	/// The graph
 	BuildGraphGenerator graph;
-
-	/// The name of the package this edge is part of
-	string pack;
+	/// The package this edge is part of
+	const(Package) pack;
+	/// The generator settings of the package
+	GeneratorSettings gs;
+	/// The build settings of the package
+	BuildSettings bs;
 	/// A description for the edge
 	string desc;
 
@@ -578,10 +619,13 @@ class Edge
 	// whether this edge is currently in progress
 	bool inProgress;
 
-	this (BuildGraphGenerator graph, in string pack, in string desc)
+	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
+			BuildSettings bs, in string desc)
 	{
 		this.graph = graph;
 		this.pack = pack;
+		this.gs = gs;
+		this.bs = bs;
 		this.desc = desc;
 		this.ind = this.graph.m_edges.length;
 		this.graph.m_edges ~= this;
@@ -593,13 +637,15 @@ class Edge
 }
 
 /// An edge which is processed by several shell commands
+/// (used for prebuild and post build)
 class CmdsEdge : Edge
 {
 	immutable(string)[] cmds;
 
-	this (BuildGraphGenerator graph, in string pack, in string desc, immutable(string)[] cmds)
+	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
+			BuildSettings bs, in string desc, immutable(string)[] cmd)
 	{
-		super(graph, pack, desc);
+		super(graph, pack, gs, bs, desc);
 		this.cmds = cmds;
 	}
 
@@ -623,30 +669,97 @@ class CmdsEdge : Edge
 
 }
 
-/// An edge which invokes a compiler
-class CompilerInvocationEdge : Edge
+/// An edge which invokes a compiler to compile object
+class CompileEdge : Edge
 {
-	CompilerInvocation invocation;
+	string src;
+	string obj;
 
-	this (BuildGraphGenerator graph, in string pack, in string desc, in CompilerInvocation invocation)
+	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
+			BuildSettings bs, in string desc, in string src, in string obj)
 	{
-		super(graph, pack, desc);
-		this.invocation = invocation;
+		super(graph, pack, gs, bs, desc);
+		this.src = src;
+		this.obj = obj;
 	}
 
 	override void process()
 	{
+		import std.array : join;
 		import std.concurrency : send, spawn, Tid, thisTid;
 
 		inProgress = true;
 
+		BuildSettings cbs = bs;
+		cbs.libs = null;
+		cbs.lflags = null;
+		cbs.sourceFiles = [ src ];
+		cbs.targetType = TargetType.object;
+		gs.compiler.prepareBuildSettings(cbs, BuildSetting.commandLine);
+		gs.compiler.setTarget(cbs, gs.platform, obj);
+		const invocation = gs.compiler.invocation(cbs, gs.platform);
+
 		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci) {
 			try {
+				int code;
 				string output;
-				if (invoke(ci, output)) {
-					send (tid, EdgeCompletion(edgeInd));
-					return;
+				if (invoke(ci, code, output)) {
+					send (tid, EdgeCompletion(edgeInd, output));
 				}
+				else {
+					send (tid, EdgeFailure(edgeInd, code, ci.args.join(" "), output));
+				}
+				return;
+			}
+			catch (Exception ex) {}
+			send (tid, EdgeFailure(edgeInd));
+		}, thisTid, ind, invocation);
+	}
+}
+
+
+/// An edge which invokes a compiler to link executable or library
+class LinkEdge : Edge
+{
+	const(string)[] objs;
+	string target;
+
+	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
+			BuildSettings bs, in string desc, in string[] objs, in string target)
+	{
+		super(graph, pack, gs, bs, desc);
+		this.objs = objs;
+		this.target = target;
+	}
+
+	override void process()
+	{
+		import dub.compilers.utils : isLinkerFile;
+		import std.algorithm : filter;
+		import std.array : array, join;
+		import std.concurrency : send, spawn, Tid, thisTid;
+
+		inProgress = true;
+
+		const isStaticLib = bs.targetType == TargetType.staticLibrary ||
+				bs.targetType == TargetType.library;
+		BuildSettings lbs = bs;
+		lbs.sourceFiles = isStaticLib ? [] : bs.sourceFiles.filter!(f => f.isLinkerFile()).array;
+		gs.compiler.setTarget(lbs, gs.platform);
+		gs.compiler.prepareBuildSettings(lbs, BuildSetting.commandLineSeparate|BuildSetting.sourceFiles);
+		const invocation = gs.compiler.linkerInvocation(lbs, gs.platform, objs);
+
+		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci) {
+			try {
+				int code;
+				string output;
+				if (invoke(ci, code, output)) {
+					send (tid, EdgeCompletion(edgeInd, output));
+				}
+				else {
+					send (tid, EdgeFailure(edgeInd, code, ci.args.join(" "), output));
+				}
+				return;
 			}
 			catch (Exception ex) {}
 			send (tid, EdgeFailure(edgeInd));
@@ -656,17 +769,6 @@ class CompilerInvocationEdge : Edge
 
 
 // helpers
-
-CompilerInvocation unitCompile(in string src, in string obj, GeneratorSettings gs, BuildSettings bs)
-{
-	bs.libs = null;
-	bs.lflags = null;
-	bs.sourceFiles = [ src ];
-	bs.targetType = TargetType.object;
-	gs.compiler.prepareBuildSettings(bs, BuildSetting.commandLine);
-	gs.compiler.setTarget(bs, gs.platform, obj);
-	return gs.compiler.invocation(bs, gs.platform);
-}
 
 string computeBuildID(in string config, in ref GeneratorSettings gs, in ref BuildSettings bs)
 {
