@@ -653,6 +653,9 @@ class Edge
 	/// Process the edge in a new thread and signal the calling thread
 	/// either with EdgeCompletion or EdgeFailure message
 	abstract void process();
+
+	/// Compute hash code to uniquely identify the edge parameters
+	abstract @property ulong hashCode();
 }
 
 /// An edge which is processed by several shell commands
@@ -706,6 +709,17 @@ class CmdsEdge : Edge
 		}, thisTid, ind, cmds, assumeUnique(env));
 	}
 
+	override @property ulong hashCode()
+	{
+		import dub.internal.utils : feedDigestData;
+		import std.digest.crc : CRC64ECMA;
+
+		CRC64ECMA hash;
+		hash.start();
+		hash.feedDigestData(cmds);
+		const bytes = hash.finish();
+		return *(cast(const(ulong)*)&bytes[0]);
+	}
 }
 
 /// An edge which invokes a compiler to compile object
@@ -753,6 +767,23 @@ class CompileEdge : Edge
 				send (tid, EdgeError(edgeInd, ex.msg));
 			}
 		}, thisTid, ind, invocation);
+	}
+
+	override @property ulong hashCode()
+	{
+		import dub.internal.utils : feedDigestData;
+		import std.digest.crc : CRC64ECMA;
+
+		CRC64ECMA hash;
+		hash.start();
+		hash.feedDigestData(src);
+		hash.feedDigestData(obj);
+		// dflags in build id
+		//hash.feedDigestData(bs.dflags);
+		hash.feedDigestData(bs.importPaths);
+		hash.feedDigestData(bs.importFiles);
+		const bytes = hash.finish();
+		return *(cast(const(ulong)*)&bytes[0]);
 	}
 }
 
@@ -804,12 +835,35 @@ class LinkEdge : Edge
 			}
 		}, thisTid, ind, invocation);
 	}
+
+	override @property ulong hashCode()
+	{
+		import dub.compilers.utils : isLinkerFile;
+		import dub.internal.utils : feedDigestData;
+		import std.algorithm : filter;
+		import std.array : array;
+		import std.conv : to;
+		import std.digest.crc : CRC64ECMA;
+
+		CRC64ECMA hash;
+		hash.start();
+		hash.feedDigestData(objs);
+		hash.feedDigestData(target);
+		hash.feedDigestData(bs.targetType);
+		// lflags in build id
+		//hash.feedDigestData(bs.lflags);
+		hash.feedDigestData(bs.libs);
+		hash.feedDigestData(bs.linkerFiles);
+		hash.feedDigestData(bs.sourceFiles.filter!(f => f.isLinkerFile()).array);
+		const bytes = hash.finish();
+		return *(cast(const(ulong)*)&bytes[0]);
+	}
 }
 
 
 // helpers
 
-string computeBuildID(in string config, in ref GeneratorSettings gs, in ref BuildSettings bs)
+string computeBuildID(in string config, ref GeneratorSettings gs, in ref BuildSettings bs)
 {
 	import dub.internal.utils : feedDigestData;
 	import std.array : join;
@@ -830,15 +884,16 @@ string computeBuildID(in string config, in ref GeneratorSettings gs, in ref Buil
 	feedDigestData(hash, bs.stringImportPaths);
 	// feedDigestData(hash, gs.platform.architecture);
 	feedDigestData(hash, gs.platform.compilerBinary);
+	feedDigestData(hash, gs.compiler.frontendVersion(gs.platform));
 	// feedDigestData(hash, gs.platform.compiler);
 	// feedDigestData(hash, gs.platform.frontendVersion);
-	auto hashstr = hash.finish().toHexString().idup;
+	auto hashstr = hash.finish().toHexString();
 
 	return format("%s-%s-%s-%s-%s_%s-%s", config, gs.buildType,
 		gs.platform.platform.join("."),
 		gs.platform.architecture.join("."),
-		gs.platform.compiler,
-		gs.platform.frontendVersion, hashstr);
+		gs.compiler.name,
+		gs.compiler.version_(gs.platform), hashstr);
 }
 
 string getTargetPath(in ref BuildSettings bs, in ref GeneratorSettings settings)
