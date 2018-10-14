@@ -51,8 +51,33 @@ class DMDCompiler : Compiler {
 		tuple(BuildOption._docs, ["-Dddocs"]),
 		tuple(BuildOption._ddox, ["-Xfdocs.json", "-Df__dummy.html"]),
 	];
+	private string versionCache;
 
 	@property string name() const { return "dmd"; }
+
+	string version_(in ref BuildPlatform platform)
+	{
+		import std.regex : matchFirst, ctRegex;
+		import std.string : lineSplitter;
+
+		if (versionCache.length) return versionCache;
+
+		auto r = ctRegex!(`v(\d+\.\d+\.\d+(-\w+)?)$`, "m");
+		invokeTool([ platform.compilerBinary, "--version" ], (int code, string output) {
+			enforce(code == 0, "Could not run `"~platform.compilerBinary~" --version`");
+			auto c = matchFirst(output, r);
+			enforce(c, "Could not parse DMD version");
+			assert(c.length >= 2);
+			c.popFront();
+			versionCache = c.front;
+		});
+		return versionCache;
+	}
+
+	string frontendVersion(in ref BuildPlatform platform)
+	{
+		return version_(platform);
+	}
 
 	BuildPlatform determinePlatform(ref BuildSettings settings, string compiler_binary, string arch_override)
 	{

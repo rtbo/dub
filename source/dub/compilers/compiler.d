@@ -75,6 +75,12 @@ interface Compiler {
 	/// Returns the canonical name of the compiler (e.g. "dmd").
 	@property string name() const;
 
+	/// Get the version of the compiler
+	string version_(in ref BuildPlatform platform);
+
+	/// Get the front-end version of the compiler
+	string frontendVersion(in ref BuildPlatform platform);
+
 	/** Determines the build platform properties given a set of build settings.
 
 		This will invoke the compiler to build a platform probe file, which

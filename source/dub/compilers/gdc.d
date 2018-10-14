@@ -51,7 +51,46 @@ class GDCCompiler : Compiler {
 		tuple(BuildOption._ddox, ["-fXf=docs.json", "-fdoc-file=__dummy.html"]),
 	];
 
+	private string versionCache;
+	private string frontendCache;
+
 	@property string name() const { return "gdc"; }
+
+	string version_(in ref BuildPlatform platform)
+	{
+		import std.regex : matchFirst, ctRegex;
+
+		if (versionCache.length) return versionCache;
+
+		auto r = ctRegex!(`\(GDC (\d+\.\d+\.\d+(-\w+)?) based on`);
+		invokeTool([ platform.compilerBinary, "--version" ], (int code, string output) {
+			enforce(code == 0, "Could not run `"~platform.compilerBinary~" --version`");
+			auto c = matchFirst(output, r);
+			enforce(c, "Could not parse GDC version");
+			assert(c.length >= 2);
+			c.popFront();
+			versionCache = c.front;
+		});
+		return versionCache;
+	}
+
+	string frontendVersion(in ref BuildPlatform platform)
+	{
+		import std.regex : matchFirst, ctRegex;
+
+		if (frontendCache.length) return frontendCache;
+
+		auto r = ctRegex!(`based on v(\d+\.\d+\.\d+(-\w+)?)`);
+		invokeTool([ platform.compilerBinary, "--version" ], (int code, string output) {
+			enforce(code == 0, "Could not run `"~platform.compilerBinary~" --version`");
+			auto c = matchFirst(output, r);
+			enforce(c, "Could not parse GDC front-end version");
+			assert(c.length >= 2);
+			c.popFront();
+			frontendCache = c.front;
+		});
+		return frontendCache;
+	}
 
 	BuildPlatform determinePlatform(ref BuildSettings settings, string compiler_binary, string arch_override)
 	{
