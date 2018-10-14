@@ -35,6 +35,9 @@ class BuildGraphGenerator : ProjectGenerator
 	private uint m_numToBuild;
 	private uint m_longestPackName;
 
+	// per package logs to track if cmd line has changed and module dependencies
+	private EdgeLog[string] m_edgeLogs;
+
 	this (Project project) {
 		super(project);
 	}
@@ -51,8 +54,12 @@ class BuildGraphGenerator : ProjectGenerator
 		m_readyFirst = null;
 		m_readyLast = null;
 		m_numToBuild = 0;
+		m_longestPackName = 0;
+		m_edgeLogs = null;
 
 		enforce(!settings.rdmd, "RDMD not supported for graph based builds");
+
+		scope(exit) cleanUpLogs();
 
 		// step 1: recursive descent to build the dependency graph
 
@@ -141,10 +148,53 @@ class BuildGraphGenerator : ProjectGenerator
 		edge.outNodes ~= output;
 	}
 
+	private EdgeLog edgeLog (Edge edge)
+	{
+		import std.path : buildNormalizedPath;
+
+		const path = edge.buildDir;
+		auto lp = path in m_edgeLogs;
+		if (lp) return *lp;
+		auto l = new EdgeLog(path);
+		m_edgeLogs[path] = l;
+		return l;
+	}
+
+	private void cleanUpLogs()
+	{
+		foreach (k, l; m_edgeLogs) {
+			l.close();
+		}
+		m_edgeLogs = null;
+	}
+
+	private void addDeps(Edge edge, in string[] deps)
+	{
+		import std.algorithm : canFind, map;
+
+		foreach (d; deps) {
+			if (edge.inNodes.map!"a.name".canFind(d)) continue;
+
+			auto np = d in m_nodes;
+			Node n;
+			if (np) {
+				n = *np;
+			}
+			else {
+				n = new FileNode(this, edge.pack.name, d);
+				m_nodes[d] = n;
+			}
+			n.outEdges ~= edge;
+			edge.inNodes ~= n;
+		}
+	}
+
 	private Node buildTargetGraph(in ref TargetInfo ti, ref GeneratorSettings gs,
 				BuildSettings bs, Node[] linkDeps, out string binPath)
 	{
+		import std.file : mkdirRecurse;
 		import std.format : format;
+		import std.path : buildNormalizedPath;
 
 		// most can be in parallel, but there is a minimal sequence:
 		// - prebuild commands (each in sequence)
@@ -155,12 +205,18 @@ class BuildGraphGenerator : ProjectGenerator
 		Node linkNode;
 
 		const packName = ti.pack.name;
+		const packPath = ti.pack.path.toString();
+		const buildId = computeBuildID(ti.config, gs, bs);
+		const buildDir = buildNormalizedPath(packPath, ".dub", "build", format("graph-%s", buildId));
+		mkdirRecurse(buildDir);
 
 		if (bs.preBuildCommands.length) {
 			auto node = new PhonyNode(this, packName, format("%s-prebuild", ti.pack.name));
 			immutable cmds = bs.preBuildCommands.idup;
 			auto edge = new CmdsEdge(
-				this, ti.pack, gs, bs, format("pre-build command%s", cmds.length > 1 ? "s" : ""), cmds
+				this, ti.pack, gs, bs,
+				format("pre-build command%s", cmds.length > 1 ? "s" : ""),
+				buildDir, cmds
 			);
 			m_preBuildNodes[packName] = node;
 			if (lastNode)
@@ -177,7 +233,7 @@ class BuildGraphGenerator : ProjectGenerator
 			//  - local vs non-local packages
 			//  - rdmd
 
-			linkNode = buildBinaryTargetGraph(ti, gs, bs, lastNode, linkDeps, binPath);
+			linkNode = buildBinaryTargetGraph(ti, gs, bs, lastNode, linkDeps, buildDir, binPath);
 			lastNode = linkNode;
 		}
 
@@ -185,7 +241,9 @@ class BuildGraphGenerator : ProjectGenerator
 			auto node = new PhonyNode(this, packName, format("%s-postbuild", ti.pack.name));
 			immutable cmds = bs.postBuildCommands.idup;
 			auto edge = new CmdsEdge(
-				this, ti.pack, gs, bs, format("post-build command%s", cmds.length > 1 ? "s" : ""), cmds
+				this, ti.pack, gs, bs,
+				format("post-build command%s", cmds.length > 1 ? "s" : ""),
+				buildDir, cmds
 			);
 			m_postBuildNodes[packName] = node;
 			if (lastNode)
@@ -202,7 +260,8 @@ class BuildGraphGenerator : ProjectGenerator
 	}
 
 	private Node buildBinaryTargetGraph(in ref TargetInfo ti, ref GeneratorSettings gs,
-			BuildSettings bs, Node preBuildNode, Node[] linkDeps, out string binPath)
+			BuildSettings bs, Node preBuildNode, Node[] linkDeps, in string buildDir,
+			out string binPath)
 	{
 		import dub.compilers.utils : isLinkerFile;
 		import std.array : array;
@@ -214,8 +273,6 @@ class BuildGraphGenerator : ProjectGenerator
 		const packName =  ti.pack.name;
 		const packPath = ti.pack.path.toString();
 		const cwd = buildNormalizedPath(getcwd());
-		const buildId = computeBuildID(ti.config, gs, bs);
-		const buildDir = buildNormalizedPath(packPath, ".dub", "build", format("graph-%s", buildId));
 
 		// shrink the command lines
 		foreach (ref f; bs.sourceFiles) f = shrinkPath(f, cwd);
@@ -231,7 +288,7 @@ class BuildGraphGenerator : ProjectGenerator
 			auto src = new FileNode(this, packName, f);
 			auto obj = new FileNode(this, packName, objPath);
 			auto edge = new CompileEdge(this, ti.pack, gs, bs,
-					"compiling "~baseName(f), f, objPath);
+					"compiling "~baseName(f), buildDir, f, objPath);
 			if (preBuildNode) {
 				connect([ preBuildNode, cast(Node)src ], edge, [ obj ]);
 			}
@@ -249,7 +306,10 @@ class BuildGraphGenerator : ProjectGenerator
 		);
 
 		auto linkNode = new FileNode(this, packName, binPath);
-		auto linkEdge = new LinkEdge(this, ti.pack, gs, bs, "linking "~baseName(binPath), objFiles, binPath);
+		auto linkEdge = new LinkEdge(
+			this, ti.pack, gs, bs, "linking "~baseName(binPath), buildDir,
+			objFiles, binPath
+		);
 
 		linkDeps ~= objNodes;
 		if (preBuildNode) linkDeps ~= preBuildNode;
@@ -264,11 +324,23 @@ class BuildGraphGenerator : ProjectGenerator
 
 		assert(node.inEdge);
 		if (node.visited) return node.mustBuild;
+		if (!node.inEdge) {
+			assert(node.exists, node.name~" does not exist");
+			node.mustBuild = false;
+			return false;
+		}
 
 		bool mustBuild;
 		bool hasDepRebuild;
 
 		const mtime = node.timeLastBuild;
+		auto log = edgeLog(node.inEdge);
+		auto entry = log.entry(node.name);
+		if (entry && entry.deps) {
+			addDeps(node.inEdge, entry.deps);
+		}
+
+		SysTime mostRecentDep;
 
 		foreach (n; node.inEdge.inNodes)
 		{
@@ -280,25 +352,26 @@ class BuildGraphGenerator : ProjectGenerator
 				mustBuild = true;
 				hasDepRebuild = true;
 			}
+            if (mostRecentDep < nmt) mostRecentDep = nmt;
 		}
 
-		// activate pre-build and post-build if necessary
+		node.checkEntry(entry, mostRecentDep);
+
+		// activate pre-build and post-build if target must be rebuilt
 		if (mustBuild && node.isTarget) {
 			auto preB = node.pack in m_preBuildNodes;
 			auto postB = node.pack in m_postBuildNodes;
 
-			if (preB) {
+			if (preB && !preB.mustBuild) {
 				preB.mustBuild = true;
 				m_numToBuild++;
 				addReady(preB.inEdge);
 				foreach (e; preB.outEdges) {
-					if (isReady(e)) {
-						removeReady(e);
-					}
+					if (isReady(e)) removeReady(e);
 				}
 				hasDepRebuild = true;
 			}
-			if (postB) {
+			if (postB && !postB.mustBuild) {
 				postB.mustBuild = true;
 				m_numToBuild++;
 			}
@@ -348,7 +421,7 @@ class BuildGraphGenerator : ProjectGenerator
 			if (getLogLevel() < LogLevel.info) return;
 			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
 			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
-			stdout.writef("\r[ %s/%s %s ] %s%s", numStr, m_numToBuild, packStr, desc,
+			stdout.writef("[ %s/%s %s ] %s%s\n", numStr, m_numToBuild, packStr, desc,
 				spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
 			stdout.flush();
 			previousLen = desc.length;
@@ -380,7 +453,8 @@ class BuildGraphGenerator : ProjectGenerator
 				removeReady(edge);
 				edge.inProgress = false;
 				foreach (n; edge.outNodes) {
-					n.mustBuild = false;
+					assert(n.exists, edge.desc ~" did not produce "~n.name);
+					n.postBuild();
 					foreach (oe; n.outEdges.filter!(e => e.outNodes.any!"a.mustBuild")) {
 						if (oe.inNodes.all!(i => !i.mustBuild)) {
 							addReady(oe);
@@ -571,7 +645,16 @@ abstract class Node
 		this.graph.m_nodes[name] = this;
 	}
 
+	abstract @property bool exists();
+
 	abstract @property SysTime timeLastBuild();
+
+	void checkEntry(in EdgeLog.Entry* entry, SysTime mostRecentDep) {}
+
+	void postBuild()
+	{
+		mustBuild = false;
+	}
 }
 
 /// A node associated with a physical file
@@ -584,11 +667,40 @@ class FileNode : Node
 		super(graph, pack, name);
 	}
 
+	override @property bool exists()
+	{
+		import std.file : file_exists = exists;
+
+		return file_exists(name);
+	}
+
 	override @property SysTime timeLastBuild()
 	{
 		import std.file : timeLastModified;
 
 		return timeLastModified(name, SysTime.min);
+	}
+
+	override void checkEntry(in EdgeLog.Entry* entry, SysTime mostRecentDep)
+	{
+		if (entry && (mostRecentDep.stdTime > entry.mtime || inEdge.hashCode != entry.hash)) {
+			mustBuild = true;
+		}
+		else if (!entry) {
+			// if we can't link this to a previous build, we follow conservative
+			// rules
+			mustBuild = true;
+		}
+
+	}
+
+	override void postBuild()
+	{
+		super.postBuild();
+
+		auto log = graph.edgeLog(inEdge);
+		const entry = EdgeLog.Entry(timeLastBuild.stdTime, inEdge.hashCode, []);
+		log.setEntry(name, entry);
 	}
 
 }
@@ -601,6 +713,11 @@ class PhonyNode : Node
 	this(BuildGraphGenerator graph, in string pack, in string name)
 	{
 		super(graph, pack, name);
+	}
+
+	override @property bool exists()
+	{
+		return true;
 	}
 
 	override @property SysTime timeLastBuild()
@@ -623,6 +740,8 @@ class Edge
 	BuildSettings bs;
 	/// A description for the edge
 	string desc;
+	/// The build directory
+	string buildDir;
 
 	Node[] inNodes;
 	Node[] outNodes;
@@ -639,13 +758,14 @@ class Edge
 	bool inProgress;
 
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
-			BuildSettings bs, in string desc)
+			BuildSettings bs, in string desc, in string buildDir)
 	{
 		this.graph = graph;
 		this.pack = pack;
 		this.gs = gs;
 		this.bs = bs;
 		this.desc = desc;
+		this.buildDir = buildDir;
 		this.ind = this.graph.m_edges.length;
 		this.graph.m_edges ~= this;
 	}
@@ -665,9 +785,9 @@ class CmdsEdge : Edge
 	immutable(string)[] cmds;
 
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
-			BuildSettings bs, in string desc, immutable(string)[] cmds)
+			BuildSettings bs, in string desc, in string buildDir, immutable(string)[] cmds)
 	{
-		super(graph, pack, gs, bs, desc);
+		super(graph, pack, gs, bs, desc, buildDir);
 		this.cmds = cmds;
 	}
 
@@ -729,9 +849,9 @@ class CompileEdge : Edge
 	string obj;
 
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
-			BuildSettings bs, in string desc, in string src, in string obj)
+			BuildSettings bs, in string desc, in string buildDir, in string src, in string obj)
 	{
-		super(graph, pack, gs, bs, desc);
+		super(graph, pack, gs, bs, desc, buildDir);
 		this.src = src;
 		this.obj = obj;
 	}
@@ -795,9 +915,9 @@ class LinkEdge : Edge
 	string target;
 
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
-			BuildSettings bs, in string desc, in string[] objs, in string target)
+			BuildSettings bs, in string desc, in string buildDir, in string[] objs, in string target)
 	{
-		super(graph, pack, gs, bs, desc);
+		super(graph, pack, gs, bs, desc, buildDir);
 		this.objs = objs;
 		this.target = target;
 	}
@@ -860,6 +980,97 @@ class LinkEdge : Edge
 	}
 }
 
+// edge log
+
+class EdgeLog
+{
+	import std.stdio : File;
+
+	enum fileName = ".edge_log";
+
+	struct Entry {
+		long mtime;
+		ulong hash;
+		const(string)[] deps;
+	}
+
+	private Entry[string] entries;
+	private string path;
+    private File file;
+    private uint dups;
+
+    this (string packPath)
+    {
+		import std.file : exists;
+        import std.format : formattedRead;
+		import std.path : buildPath;
+
+		path = buildPath(packPath, fileName);
+
+		if (!path.exists) {
+			file = File(path, "w");
+			file.reopen(path, "a+");
+		}
+		else {
+        	file = File(path, "a+");
+		}
+
+        foreach (l; file.byLineCopy) {
+            Entry e;
+            string output;
+            string[] deps;
+            formattedRead!`"%s" %s %s %s`(l, output, e.mtime, e.hash, deps);
+            e.deps = deps;
+            auto ep = output in entries;
+            if (ep) {
+                *ep = e;
+                dups++;
+            }
+            else {
+                entries[output] = e;
+            }
+        }
+    }
+
+    void close()
+    {
+        if (dups*10 > entries.length) {
+            file.reopen(path, "w");
+            foreach (output, e; entries) {
+				writeEntry(output, e);
+            }
+            file.close();
+        }
+		else {
+			file.close();
+		}
+    }
+
+    const(Entry)* entry(in string output) const
+    {
+        return output in entries;
+    }
+
+    void setEntry(in string output, in Entry entry)
+    {
+        auto ep = output in entries;
+        if (ep) {
+            *ep = entry;
+            dups++;
+        }
+        else {
+            entries[output] = entry;
+        }
+		writeEntry(output, entry);
+		file.flush();
+    }
+
+	private void writeEntry(in string output, in Entry entry)
+	{
+		file.writefln(`"%s" %s %s %s`, output, entry.mtime, entry.hash, entry.deps);
+	}
+}
+
 
 // helpers
 
@@ -889,8 +1100,7 @@ string computeBuildID(in string config, ref GeneratorSettings gs, in ref BuildSe
 	// feedDigestData(hash, gs.platform.frontendVersion);
 	auto hashstr = hash.finish().toHexString();
 
-	return format("%s-%s-%s-%s-%s_%s-%s", config, gs.buildType,
-		gs.platform.platform.join("."),
+	return format("%s-%s-%s-%s_%s-%s", config, gs.buildType,
 		gs.platform.architecture.join("."),
 		gs.compiler.name,
 		gs.compiler.version_(gs.platform), hashstr);
