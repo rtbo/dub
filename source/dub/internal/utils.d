@@ -96,6 +96,19 @@ auto lockFile(string path, Duration timeout)
 	}
 }
 
+/// Get a handle on a nul file (/dev/null on Posix, NUL on windows)
+auto nulFile(in string mode)
+{
+	import std.stdio : File;
+
+	version(Posix) {
+		return File("/dev/null", mode);
+	}
+	version(Windows) {
+		return File("NUL", mode);
+	}
+}
+
 static ~this()
 {
 	foreach (path; temporary_files)

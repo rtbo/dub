@@ -258,14 +258,19 @@ class DMDCompiler : Compiler {
 		return  lflags.map!(f => "-L"~f)().array();
 	}
 
-	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform)
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile)
 	{
 		import std.exception  : assumeUnique;
+		import std.format : format;
+		import std.range : only;
 
 		const(string)[] args = [ platform.compilerBinary ] ~ settings.dflags;
 		if (platform.frontendVersion >= 2066) args ~= "-vcolumns";
+		if (depfile) {
+			args ~= format("-deps=%s", escapeArgs([depfile]).front);
+		}
 
-		return CompilerInvocation( assumeUnique(args),  "@%s" );
+		return CompilerInvocation( assumeUnique(args),  "@%s", depfile );
 	}
 
 	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects)
@@ -282,7 +287,6 @@ class DMDCompiler : Compiler {
 
 		return CompilerInvocation( assumeUnique(args), "@%s" );
 	}
-
 
 	private auto escapeArgs(in string[] args)
 	{

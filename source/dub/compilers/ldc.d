@@ -252,7 +252,7 @@ class LDCCompiler : Compiler {
 		return  lflags.map!(s => "-L="~s)().array();
 	}
 
-	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform)
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile)
 	{
 		return CompilerInvocation.init;
 	}

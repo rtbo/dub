@@ -461,6 +461,15 @@ class BuildGraphGenerator : ProjectGenerator
 						}
 					}
 				}
+				if (ec.output.length) {
+					logInfo("\nmessage from %s:", edge.desc);
+					logInfo("%s", ec.cmd);
+					logInfo("%s", ec.output);
+					if (m_readyFirst !is null) {
+						// next might start by \r
+						logInfo("");
+					}
+				}
 			}
 
 			void failure(EdgeFailure ef) {
@@ -600,6 +609,7 @@ private:
 struct EdgeCompletion
 {
 	size_t edgeInd;
+	string cmd;
 	string output;
 	immutable(string)[] deps;
 }
@@ -793,6 +803,7 @@ class CmdsEdge : Edge
 
 	override void process()
 	{
+		import dub.internal.utils : nulFile;
 		import std.concurrency : send, spawn, Tid, thisTid;
 		import std.exception : assumeUnique;
 		import std.process : pipe, spawnShell, wait;
@@ -809,9 +820,9 @@ class CmdsEdge : Edge
 				foreach (cmd; cmds) {
 					string buf;
 					auto p = pipe();
-					auto pid = spawnShell(cmd, stdin, p.writeEnd, p.writeEnd, env);
-					foreach (l; p.readEnd.byLineCopy(Yes.keepTerminator)) {
-						buf ~= l;
+					auto pid = spawnShell(cmd, nulFile("r"), p.writeEnd, p.writeEnd, env);
+					foreach (l; p.readEnd.byLine(Yes.keepTerminator)) {
+						buf ~= l.idup;
 					}
 					const code = wait(pid);
 					if (code != 0) {
@@ -821,7 +832,7 @@ class CmdsEdge : Edge
 						output ~= cmd ~ "\n" ~ buf;
 					}
 				}
-				send(tid, EdgeCompletion(edgeInd, output));
+				send(tid, EdgeCompletion(edgeInd, "", output));
 			}
 			catch (Exception ex) {
 				send(tid, EdgeError(edgeInd, ex.msg));
@@ -848,6 +859,8 @@ class CompileEdge : Edge
 	string src;
 	string obj;
 
+	CompilerInvocation invocation;
+
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
 			BuildSettings bs, in string desc, in string buildDir, in string src, in string obj)
 	{
@@ -856,12 +869,9 @@ class CompileEdge : Edge
 		this.obj = obj;
 	}
 
-	override void process()
+	private void prepareInvocation()
 	{
-		import std.array : join;
-		import std.concurrency : send, spawn, Tid, thisTid;
-
-		inProgress = true;
+		if (invocation.args.length) return;
 
 		BuildSettings cbs = bs;
 		cbs.libs = null;
@@ -870,17 +880,33 @@ class CompileEdge : Edge
 		cbs.targetType = TargetType.object;
 		gs.compiler.prepareBuildSettings(cbs, BuildSetting.commandLine);
 		gs.compiler.setTarget(cbs, gs.platform, obj);
-		const invocation = gs.compiler.invocation(cbs, gs.platform);
+		invocation = gs.compiler.invocation(cbs, gs.platform);
+	}
+
+	override void process()
+	{
+		import std.array : join;
+		import std.concurrency : send, spawn, Tid, thisTid;
+		import std.file : mkdirRecurse;
+		import std.path : dirName;
+
+		inProgress = true;
+
+		prepareInvocation();
 
 		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci) {
 			try {
 				int code;
 				string output;
+				const cmd = ci.args.join(" ");
+				if (ci.depfile.length) {
+					mkdirRecurse(dirName(ci.depfile));
+				}
 				if (invoke(ci, code, output)) {
-					send (tid, EdgeCompletion(edgeInd, output));
+					send (tid, EdgeCompletion(edgeInd, cmd, output));
 				}
 				else {
-					send (tid, EdgeFailure(edgeInd, code, ci.args.join(" "), output));
+					send (tid, EdgeFailure(edgeInd, code, cmd, output));
 				}
 			}
 			catch (Exception ex) {
@@ -894,14 +920,11 @@ class CompileEdge : Edge
 		import dub.internal.utils : feedDigestData;
 		import std.digest.crc : CRC64ECMA;
 
+		prepareInvocation();
+
 		CRC64ECMA hash;
 		hash.start();
-		hash.feedDigestData(src);
-		hash.feedDigestData(obj);
-		// dflags in build id
-		//hash.feedDigestData(bs.dflags);
-		hash.feedDigestData(bs.importPaths);
-		hash.feedDigestData(bs.importFiles);
+		hash.feedDigestData(invocation.args);
 		const bytes = hash.finish();
 		return *(cast(const(ulong)*)&bytes[0]);
 	}
@@ -914,6 +937,8 @@ class LinkEdge : Edge
 	const(string)[] objs;
 	string target;
 
+	CompilerInvocation invocation;
+
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
 			BuildSettings bs, in string desc, in string buildDir, in string[] objs, in string target)
 	{
@@ -922,14 +947,13 @@ class LinkEdge : Edge
 		this.target = target;
 	}
 
-	override void process()
+	private void prepareInvocation()
 	{
 		import dub.compilers.utils : isLinkerFile;
 		import std.algorithm : filter;
-		import std.array : array, join;
-		import std.concurrency : send, spawn, Tid, thisTid;
+		import std.array : array;
 
-		inProgress = true;
+		if (invocation.args.length) return;
 
 		const isStaticLib = bs.targetType == TargetType.staticLibrary ||
 				bs.targetType == TargetType.library;
@@ -937,17 +961,28 @@ class LinkEdge : Edge
 		lbs.sourceFiles = isStaticLib ? [] : bs.sourceFiles.filter!(f => f.isLinkerFile()).array;
 		gs.compiler.setTarget(lbs, gs.platform);
 		gs.compiler.prepareBuildSettings(lbs, BuildSetting.commandLineSeparate|BuildSetting.sourceFiles);
-		const invocation = gs.compiler.linkerInvocation(lbs, gs.platform, objs);
+		invocation = gs.compiler.linkerInvocation(lbs, gs.platform, objs);
+	}
+
+	override void process()
+	{
+		import std.array : join;
+		import std.concurrency : send, spawn, Tid, thisTid;
+
+		inProgress = true;
+
+		prepareInvocation();
 
 		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci) {
 			try {
 				int code;
 				string output;
+				const cmd = ci.args.join(" ");
 				if (invoke(ci, code, output)) {
-					send (tid, EdgeCompletion(edgeInd, output));
+					send (tid, EdgeCompletion(edgeInd, cmd, output));
 				}
 				else {
-					send (tid, EdgeFailure(edgeInd, code, ci.args.join(" "), output));
+					send (tid, EdgeFailure(edgeInd, code, cmd, output));
 				}
 			}
 			catch (Exception ex) {
@@ -958,23 +993,14 @@ class LinkEdge : Edge
 
 	override @property ulong hashCode()
 	{
-		import dub.compilers.utils : isLinkerFile;
 		import dub.internal.utils : feedDigestData;
-		import std.algorithm : filter;
-		import std.array : array;
-		import std.conv : to;
 		import std.digest.crc : CRC64ECMA;
+
+		prepareInvocation();
 
 		CRC64ECMA hash;
 		hash.start();
-		hash.feedDigestData(objs);
-		hash.feedDigestData(target);
-		hash.feedDigestData(bs.targetType);
-		// lflags in build id
-		//hash.feedDigestData(bs.lflags);
-		hash.feedDigestData(bs.libs);
-		hash.feedDigestData(bs.linkerFiles);
-		hash.feedDigestData(bs.sourceFiles.filter!(f => f.isLinkerFile()).array);
+		hash.feedDigestData(invocation.args);
 		const bytes = hash.finish();
 		return *(cast(const(ulong)*)&bytes[0]);
 	}

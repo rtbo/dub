@@ -67,7 +67,7 @@ struct CompilerInvocation
 	/// with args[1 .. $] as content (one arg per line)
 	string rspFormat;
 
-	/// a dependency file produced by the invocation
+	/// A dependency file written by the compiler
 	string depfile;
 }
 
@@ -113,7 +113,7 @@ interface Compiler {
 	string[] lflagsToDFlags(in string[] lflags) const;
 
 	/// Get arguments for a deferred invocation
-	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform);
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile);
 
 	/// Get arguments for a deferred linker invocation
 	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects);
@@ -203,12 +203,12 @@ class CompilerInvocationFailed : Exception
 /// Perform the compiler invocation
 bool invoke(in CompilerInvocation ci, out int code, out string output)
 {
-	import dub.internal.utils : getTempFile;
+	import dub.internal.utils : getTempFile, nulFile;
 	import std.exception : enforce;
 	import std.file : remove, write;
 	import std.format : format;
 	import std.process : pipe, spawnProcess, wait;
-	import std.stdio : File, stdin;
+	import std.stdio : File;
 	import std.typecons : Yes;
 
 	string resFile;
@@ -223,9 +223,9 @@ bool invoke(in CompilerInvocation ci, out int code, out string output)
 	}
 
 	auto p = pipe();
-	auto pid = spawnProcess(args, stdin, p.writeEnd, p.writeEnd);
-	foreach (l; p.readEnd.byLineCopy(Yes.keepTerminator)) {
-		output ~= l;
+	auto pid = spawnProcess(args, nulFile("r"), p.writeEnd, p.writeEnd);
+	foreach (l; p.readEnd.byLine(Yes.keepTerminator)) {
+		output ~= l.idup;
 	}
 	code = wait(pid);
 	if (resFile) remove(resFile);

@@ -265,7 +265,7 @@ class GDCCompiler : Compiler {
 		return  dflags;
 	}
 
-	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform)
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile)
 	{
 		return CompilerInvocation.init;
 	}
