@@ -81,6 +81,12 @@ class ProjectGenerator
 		m_project = project;
 	}
 
+	/// Get the Project associated with this generator
+	@property Project project()
+	{
+		return m_project;
+	}
+
 	/** Performs the full generator process.
 	*/
 	final void generate(GeneratorSettings settings)
