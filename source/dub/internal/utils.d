@@ -18,6 +18,7 @@ import core.time : Duration;
 import std.algorithm : canFind, startsWith;
 import std.array : appender;
 import std.conv : to;
+import std.digest : isDigest;
 import std.exception : enforce;
 import std.file;
 import std.string : format;
@@ -567,4 +568,32 @@ string getModuleNameFromFile(string filePath) {
 
 	logDiagnostic("Get module name from path: " ~ filePath);
 	return getModuleNameFromContent(fileContent);
+}
+
+void feedDigestData(D)(ref D digest, in string s)
+if (isDigest!D)
+{
+    digest.put(cast(ubyte[])s);
+    digest.put(0);
+}
+
+void feedDigestData(D)(ref D digest, in string[] ss)
+if (isDigest!D)
+{
+    import std.bitmanip : nativeToLittleEndian;
+
+    digest.put(nativeToLittleEndian(cast(uint)ss.length));
+    foreach (s; ss) {
+        digest.put(cast(ubyte[])s);
+        digest.put(0);
+    }
+}
+
+void feedDigestData(D, V)(ref D digest, in V val)
+if (isDigest!D && (is(V == enum) || isIntegral!V))
+{
+    import std.bitmanip : nativeToLittleEndian;
+
+    digest.put(nativeToLittleEndian(val));
+    digest.put(0);
 }

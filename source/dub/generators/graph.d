@@ -811,8 +811,8 @@ class LinkEdge : Edge
 
 string computeBuildID(in string config, in ref GeneratorSettings gs, in ref BuildSettings bs)
 {
+	import dub.internal.utils : feedDigestData;
 	import std.array : join;
-	import std.bitmanip : nativeToLittleEndian;
 	import std.conv : to;
 	import std.digest : toHexString;
 	import std.digest.crc : CRC64ECMA;
@@ -820,25 +820,18 @@ string computeBuildID(in string config, in ref GeneratorSettings gs, in ref Buil
 
 	CRC64ECMA hash;
 	hash.start();
-	void addHash(in string[] strings...) {
-		foreach (s; strings) { hash.put(cast(ubyte[])s); hash.put(0); }
-		hash.put(0);
-	}
-	void addHashI(int value) {
-		hash.put(nativeToLittleEndian(value));
-	}
-	addHash(bs.versions);
-	addHash(bs.debugVersions);
-	//addHash(bs.versionLevel);
-	//addHash(bs.debugLevel);
-	addHash(bs.dflags);
-	addHash(bs.lflags);
-	addHash((cast(uint)bs.options).to!string);
-	addHash(bs.stringImportPaths);
-	// addHash(gs.platform.architecture);
-	addHash(gs.platform.compilerBinary);
-	// addHash(gs.platform.compiler);
-	// addHashI(gs.platform.frontendVersion);
+	feedDigestData(hash, bs.versions);
+	feedDigestData(hash, bs.debugVersions);
+	//feedDigestData(hash, bs.versionLevel);
+	//feedDigestData(hash, bs.debugLevel);
+	feedDigestData(hash, bs.dflags);
+	feedDigestData(hash, bs.lflags);
+	feedDigestData(hash, (cast(uint)bs.options).to!string);
+	feedDigestData(hash, bs.stringImportPaths);
+	// feedDigestData(hash, gs.platform.architecture);
+	feedDigestData(hash, gs.platform.compilerBinary);
+	// feedDigestData(hash, gs.platform.compiler);
+	// feedDigestData(hash, gs.platform.frontendVersion);
 	auto hashstr = hash.finish().toHexString().idup;
 
 	return format("%s-%s-%s-%s-%s_%s-%s", config, gs.buildType,
