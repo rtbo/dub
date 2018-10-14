@@ -158,7 +158,10 @@ class BuildGraphGenerator : ProjectGenerator
 
 		if (bs.preBuildCommands.length) {
 			auto node = new PhonyNode(this, packName, format("%s-prebuild", ti.pack.name));
-			auto edge = new CmdsEdge(this, ti.pack, gs, bs, "pre-build commands", bs.preBuildCommands.idup);
+			immutable cmds = bs.preBuildCommands.idup;
+			auto edge = new CmdsEdge(
+				this, ti.pack, gs, bs, format("pre-build command%s", cmds.length > 1 ? "s" : ""), cmds
+			);
 			m_preBuildNodes[packName] = node;
 			if (lastNode)
 				connect(lastNode, edge, node);
@@ -180,7 +183,10 @@ class BuildGraphGenerator : ProjectGenerator
 
 		if (bs.postBuildCommands.length) {
 			auto node = new PhonyNode(this, packName, format("%s-postbuild", ti.pack.name));
-			auto edge = new CmdsEdge(this, ti.pack, gs, bs, "post-build commands", bs.postBuildCommands.idup);
+			immutable cmds = bs.postBuildCommands.idup;
+			auto edge = new CmdsEdge(
+				this, ti.pack, gs, bs, format("post-build command%s", cmds.length > 1 ? "s" : ""), cmds
+			);
 			m_postBuildNodes[packName] = node;
 			if (lastNode)
 				connect(lastNode, edge, node);
@@ -283,6 +289,7 @@ class BuildGraphGenerator : ProjectGenerator
 
 			if (preB) {
 				preB.mustBuild = true;
+				m_numToBuild++;
 				addReady(preB.inEdge);
 				foreach (e; preB.outEdges) {
 					if (isReady(e)) {
@@ -293,6 +300,7 @@ class BuildGraphGenerator : ProjectGenerator
 			}
 			if (postB) {
 				postB.mustBuild = true;
+				m_numToBuild++;
 			}
 		}
 
@@ -312,6 +320,7 @@ class BuildGraphGenerator : ProjectGenerator
 	{
 		import core.time : dur;
 		import std.concurrency : receive, receiveTimeout;
+		import std.format : format;
 
 		int numLen(in int num) {
 			auto cmp = 10;
@@ -334,13 +343,12 @@ class BuildGraphGenerator : ProjectGenerator
 		size_t previousLen;
 		void printProgress(in string packName, in string desc)
 		{
-			import std.format : format;
 			import std.stdio : stdout;
 
 			if (getLogLevel() < LogLevel.info) return;
 			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
 			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
-			stdout.writef("[ %s/%s %s ] %s%s\n", numStr, m_numToBuild, packStr, desc,
+			stdout.writef("\r[ %s/%s %s ] %s%s", numStr, m_numToBuild, packStr, desc,
 				spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
 			stdout.flush();
 			previousLen = desc.length;
@@ -386,10 +394,15 @@ class BuildGraphGenerator : ProjectGenerator
 				throw new BuildFailedException(edge.desc, ef.cmd, ef.output, ef.code);
 			}
 
+			void error(EdgeError ee) {
+				auto edge = m_edges[ee.edgeInd];
+				throw new Exception(format("%s: %s failed: %s", edge.pack.name, edge.desc, ee.msg));
+			}
+
             // must wait for at least one job
-            receive(&completion, &failure);
+            receive(&completion, &failure, &error);
             // purge all that are already waiting
-            while(receiveTimeout(dur!"msecs"(-1), &completion, &failure)) {}
+            while(receiveTimeout(dur!"msecs"(-1), &completion, &failure, &error)) {}
 		}
 	}
 
@@ -525,6 +538,12 @@ struct EdgeFailure
 	string output;
 }
 
+struct EdgeError
+{
+	size_t edgeInd;
+	string msg;
+}
+
 // graph types
 
 abstract class Node
@@ -643,7 +662,7 @@ class CmdsEdge : Edge
 	immutable(string)[] cmds;
 
 	this (BuildGraphGenerator graph, const(Package) pack, GeneratorSettings gs,
-			BuildSettings bs, in string desc, immutable(string)[] cmd)
+			BuildSettings bs, in string desc, immutable(string)[] cmds)
 	{
 		super(graph, pack, gs, bs, desc);
 		this.cmds = cmds;
@@ -651,20 +670,40 @@ class CmdsEdge : Edge
 
 	override void process()
 	{
-		import dub.internal.utils : runCommands;
 		import std.concurrency : send, spawn, Tid, thisTid;
+		import std.exception : assumeUnique;
+		import std.process : pipe, spawnShell, wait;
+		import std.stdio : stdin;
+		import std.typecons : Yes;
 
 		inProgress = true;
 
-		spawn((Tid tid, size_t edgeInd, immutable(string)[] cmds) {
+		auto env = prepareCommandsEnvironment(pack, graph.project, gs, bs);
+
+		spawn((Tid tid, size_t edgeInd, immutable(string)[] cmds, immutable(string[string]) env) {
 			try {
-				runCommands(cmds);
-				send(tid, EdgeCompletion(edgeInd));
+				string output;
+				foreach (cmd; cmds) {
+					string buf;
+					auto p = pipe();
+					auto pid = spawnShell(cmd, stdin, p.writeEnd, p.writeEnd, env);
+					foreach (l; p.readEnd.byLineCopy(Yes.keepTerminator)) {
+						buf ~= l;
+					}
+					const code = wait(pid);
+					if (code != 0) {
+						send(tid, EdgeFailure(edgeInd, code, cmd, output));
+					}
+					else if (buf.length) {
+						output ~= cmd ~ "\n" ~ buf;
+					}
+				}
+				send(tid, EdgeCompletion(edgeInd, output));
 			}
 			catch (Exception ex) {
-				send(tid, EdgeFailure(edgeInd));
+				send(tid, EdgeError(edgeInd, ex.msg));
 			}
-		}, thisTid, ind, cmds);
+		}, thisTid, ind, cmds, assumeUnique(env));
 	}
 
 }
@@ -709,10 +748,10 @@ class CompileEdge : Edge
 				else {
 					send (tid, EdgeFailure(edgeInd, code, ci.args.join(" "), output));
 				}
-				return;
 			}
-			catch (Exception ex) {}
-			send (tid, EdgeFailure(edgeInd));
+			catch (Exception ex) {
+				send (tid, EdgeError(edgeInd, ex.msg));
+			}
 		}, thisTid, ind, invocation);
 	}
 }
@@ -759,10 +798,10 @@ class LinkEdge : Edge
 				else {
 					send (tid, EdgeFailure(edgeInd, code, ci.args.join(" "), output));
 				}
-				return;
 			}
-			catch (Exception ex) {}
-			send (tid, EdgeFailure(edgeInd));
+			catch (Exception ex) {
+				send (tid, EdgeError(edgeInd, ex.msg));
+			}
 		}, thisTid, ind, invocation);
 	}
 }
