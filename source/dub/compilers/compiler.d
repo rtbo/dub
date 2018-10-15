@@ -113,7 +113,7 @@ interface Compiler {
 	string[] lflagsToDFlags(in string[] lflags) const;
 
 	/// Get arguments for a deferred invocation
-	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile);
+	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile=null);
 
 	/// Get arguments for a deferred linker invocation
 	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects);
