@@ -224,8 +224,9 @@ bool invoke(in CompilerInvocation ci, out int code, out string output)
 
 	auto p = pipe();
 	auto pid = spawnProcess(args, nulFile("r"), p.writeEnd, p.writeEnd);
-	foreach (l; p.readEnd.byLine(Yes.keepTerminator)) {
-		output ~= l.idup;
+	ubyte[4096] buf;
+	foreach (chunk; p.readEnd.byChunk(buf[])) {
+		output ~= chunk;
 	}
 	code = wait(pid);
 	if (resFile) remove(resFile);

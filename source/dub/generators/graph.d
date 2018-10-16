@@ -822,19 +822,20 @@ class CmdsEdge : Edge
 		spawn((Tid tid, size_t edgeInd, immutable(string)[] cmds, immutable(string[string]) env) {
 			try {
 				string output;
+				ubyte[4096] buf;
 				foreach (cmd; cmds) {
-					string buf;
+					string cmdOutput;
 					auto p = pipe();
 					auto pid = spawnShell(cmd, nulFile("r"), p.writeEnd, p.writeEnd, env);
-					foreach (l; p.readEnd.byLine(Yes.keepTerminator)) {
-						buf ~= l.idup;
+					foreach (chunk; p.readEnd.byChunk(buf[])) {
+						cmdOutput ~= chunk;
 					}
 					const code = wait(pid);
 					if (code != 0) {
-						send(tid, EdgeFailure(edgeInd, code, cmd, output));
+						send(tid, EdgeFailure(edgeInd, code, cmd, cmdOutput));
 					}
 					else if (buf.length) {
-						output ~= cmd ~ "\n" ~ buf;
+						output ~= cmd ~ "\n" ~ cmdOutput;
 					}
 				}
 				send(tid, EdgeCompletion(edgeInd, "", output));
