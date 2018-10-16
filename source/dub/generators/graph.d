@@ -454,7 +454,7 @@ class BuildGraphGenerator : ProjectGenerator
 				edge.inProgress = false;
 				foreach (n; edge.outNodes) {
 					assert(n.exists, edge.desc ~" did not produce "~n.name);
-					n.postBuild();
+					n.postBuild(ec.deps);
 					foreach (oe; n.outEdges.filter!(e => e.outNodes.any!"a.mustBuild")) {
 						if (oe.inNodes.all!(i => !i.mustBuild)) {
 							addReady(oe);
@@ -661,7 +661,7 @@ abstract class Node
 
 	void checkEntry(in EdgeLog.Entry* entry, SysTime mostRecentDep) {}
 
-	void postBuild()
+	void postBuild(in string[] deps)
 	{
 		mustBuild = false;
 	}
@@ -704,12 +704,12 @@ class FileNode : Node
 
 	}
 
-	override void postBuild()
+	override void postBuild(in string[] deps)
 	{
-		super.postBuild();
+		super.postBuild(deps);
 
 		auto log = graph.edgeLog(inEdge);
-		const entry = EdgeLog.Entry(timeLastBuild.stdTime, inEdge.hashCode, []);
+		const entry = EdgeLog.Entry(timeLastBuild.stdTime, inEdge.hashCode, deps);
 		log.setEntry(name, entry);
 	}
 
@@ -894,7 +894,9 @@ class CompileEdge : Edge
 
 		prepareInvocation();
 
-		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci) {
+		spawn((Tid tid, size_t edgeInd, CompilerInvocation ci, in string src,
+				immutable(string[]) importPaths)
+		{
 			try {
 				int code;
 				string output;
@@ -903,7 +905,19 @@ class CompileEdge : Edge
 					mkdirRecurse(dirName(ci.depfile));
 				}
 				if (invoke(ci, code, output)) {
-					send (tid, EdgeCompletion(edgeInd, cmd, output));
+					// would normally use dmd -deps option here, but the tests I did show it really buggy:
+					//  - ~3000 lines exported for each file
+					//  - builds about 10x slower (may be due to IO or to my code processing of the too many lines)
+					//  - prints lines for every module without possibility to filter out core and std
+					//  - likely perform recursive analysis, which is not needed here
+					//  - occasional ICE
+					// so I fallback on libdparse based import parsing
+					import dub.generators.imports : moduleDeps;
+					import std.exception : assumeUnique;
+
+					immutable deps = assumeUnique(moduleDeps(src, importPaths));
+
+					send (tid, EdgeCompletion(edgeInd, cmd, output, deps));
 				}
 				else {
 					send (tid, EdgeFailure(edgeInd, code, cmd, output));
@@ -912,7 +926,7 @@ class CompileEdge : Edge
 			catch (Exception ex) {
 				send (tid, EdgeError(edgeInd, ex.msg));
 			}
-		}, thisTid, ind, invocation);
+		}, thisTid, ind, invocation, src, bs.importPaths.idup);
 	}
 
 	override @property ulong hashCode()
