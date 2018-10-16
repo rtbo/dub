@@ -17,6 +17,7 @@ configuration "application" {
 configuration "graph-app" {
 	targetType "executable"
 	mainSourceFile "source/app.d"
+	dependency "libdparse" version="~>0.9.9"
 	libs "curl"
 	versions "DubUseCurl" "DubUseGraphBuild"
 }
