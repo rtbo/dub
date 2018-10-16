@@ -394,6 +394,7 @@ class BuildGraphGenerator : ProjectGenerator
 		import core.time : dur;
 		import std.concurrency : receive, receiveTimeout;
 		import std.format : format;
+		import std.stdio : stdout;
 
 		int numLen(in int num) {
 			auto cmp = 10;
@@ -404,21 +405,24 @@ class BuildGraphGenerator : ProjectGenerator
 			}
 			return res;
 		}
-
-		const maxLen = numLen(m_numToBuild);
-		int num=1;
-
 		string spaces(in size_t numSpaces)
 		{
 			import std.array : replicate;
 			return replicate(" ", numSpaces);
 		}
+
+		enum progLogLevel = LogLevel.info;
+
+		const maxLen = numLen(m_numToBuild);
+		int num=1;
 		size_t previousLen;
+		bool consoleLocked;
+		string progBuffer;
+		string[] logBuffer;
+
 		void printProgress(in string packName, in string desc)
 		{
-			import std.stdio : stdout;
-
-			if (getLogLevel() < LogLevel.info) return;
+			if (getLogLevel() < progLogLevel) return;
 
 			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
 			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
@@ -430,25 +434,37 @@ class BuildGraphGenerator : ProjectGenerator
 				enum fmt = "[ %s/%s %s ] %s%s\n";
 			}
 
-			stdout.writef(fmt, numStr, m_numToBuild, packStr, desc,
+			const msg = format(fmt, numStr, m_numToBuild, packStr, desc,
 				spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
-			stdout.flush();
+
+			if (!consoleLocked) {
+				stdout.write(msg);
+				stdout.flush();
+			}
+			else {
+				progBuffer = msg;
+			}
+
 			previousLen = desc.length;
 		}
 
 		uint jobs;
 
-		scope(exit) logInfo(""); // log new line
+		scope(exit) log(progLogLevel, ""); // log new line
 
 		while (m_readyFirst) {
 
 			auto e = m_readyFirst;
 
 			while (e && jobs < maxJobs) {
-				if (!e.inProgress) {
+				if (!e.inProgress && (!consoleLocked || !e.locksConsole)) {
 					jobs += e.jobs;
 					printProgress(e.pack.name, e.desc);
 					e.process();
+					if (e.locksConsole) {
+						consoleLocked = true;
+						log(progLogLevel, "");
+					}
 				}
 				e = e.readyNext;
 			}
@@ -470,10 +486,32 @@ class BuildGraphGenerator : ProjectGenerator
 						}
 					}
 				}
+				const unlockConsole = consoleLocked && edge.locksConsole;
+				if (unlockConsole) {
+					consoleLocked = false;
+					foreach (lb; logBuffer) {
+						log(progLogLevel, "%s", lb);
+					}
+					logBuffer = null;
+				}
 				if (ec.output.length) {
-					logInfo("\nmessage from %s:", edge.desc);
-					logInfo("%s", ec.cmd);
-					logInfo("%s", ec.output);
+					const msg = format(
+						"\nmessage from %s - %s:\n%s\n%s",
+						edge.pack.name, edge.desc, ec.cmd, ec.output
+					);
+					if (consoleLocked) {
+						logBuffer ~= msg;
+					}
+					else {
+						log(progLogLevel, "%s", msg);
+					}
+				}
+				if (unlockConsole && progBuffer) {
+					if (getLogLevel() < progLogLevel) {
+						stdout.write(progBuffer);
+						stdout.flush();
+					}
+					progBuffer = null;
 				}
 			}
 
@@ -785,6 +823,11 @@ class Edge
 		this.graph.m_edges ~= this;
 	}
 
+	/// Returns whether this edge should have exclusive access on the console.
+	@property bool locksConsole() {
+		return false;
+	}
+
 	/// Process the edge in a new thread and signal the calling thread
 	/// either with EdgeCompletion or EdgeFailure message
 	abstract void process();
@@ -806,13 +849,18 @@ class CmdsEdge : Edge
 		this.cmds = cmds;
 	}
 
+	override @property bool locksConsole()
+	{
+		return true;
+	}
+
 	override void process()
 	{
 		import dub.internal.utils : nulFile;
 		import std.concurrency : send, spawn, Tid, thisTid;
 		import std.exception : assumeUnique;
-		import std.process : pipe, spawnShell, wait;
-		import std.stdio : stdin;
+		import std.process : Config, pipe, spawnShell, wait;
+		import std.stdio : stdin, stdout, stderr;
 		import std.typecons : Yes;
 
 		inProgress = true;
@@ -821,24 +869,15 @@ class CmdsEdge : Edge
 
 		spawn((Tid tid, size_t edgeInd, immutable(string)[] cmds, immutable(string[string]) env) {
 			try {
-				string output;
-				ubyte[4096] buf;
 				foreach (cmd; cmds) {
-					string cmdOutput;
-					auto p = pipe();
-					auto pid = spawnShell(cmd, nulFile("r"), p.writeEnd, p.writeEnd, env);
-					foreach (chunk; p.readEnd.byChunk(buf[])) {
-						cmdOutput ~= chunk;
-					}
+					enum conf = Config.retainStdin | Config.retainStdout | Config.retainStderr;
+					auto pid = spawnShell(cmd, stdin, stdout, stderr, env, conf);
 					const code = wait(pid);
 					if (code != 0) {
-						send(tid, EdgeFailure(edgeInd, code, cmd, cmdOutput));
-					}
-					else if (buf.length) {
-						output ~= cmd ~ "\n" ~ cmdOutput;
+						send(tid, EdgeFailure(edgeInd, code, cmd, null));
 					}
 				}
-				send(tid, EdgeCompletion(edgeInd, "", output));
+				send(tid, EdgeCompletion(edgeInd));
 			}
 			catch (Exception ex) {
 				send(tid, EdgeError(edgeInd, ex.msg));
