@@ -419,9 +419,18 @@ class BuildGraphGenerator : ProjectGenerator
 			import std.stdio : stdout;
 
 			if (getLogLevel() < LogLevel.info) return;
+
 			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
 			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
-			stdout.writef("[ %s/%s %s ] %s%s\n", numStr, m_numToBuild, packStr, desc,
+
+			enum printSameLine = true;
+			static if (printSameLine) {
+				enum fmt = "\r[ %s/%s %s ] %s%s";
+			} else {
+				enum fmt = "[ %s/%s %s ] %s%s\n";
+			}
+
+			stdout.writef(fmt, numStr, m_numToBuild, packStr, desc,
 				spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
 			stdout.flush();
 			previousLen = desc.length;
@@ -465,10 +474,6 @@ class BuildGraphGenerator : ProjectGenerator
 					logInfo("\nmessage from %s:", edge.desc);
 					logInfo("%s", ec.cmd);
 					logInfo("%s", ec.output);
-					if (m_readyFirst !is null) {
-						// next might start by \r
-						logInfo("");
-					}
 				}
 			}
 
