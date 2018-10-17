@@ -33,7 +33,7 @@ class BuildGraphGenerator : ProjectGenerator
 
 	// a few stats for printing progress
 	private uint m_numToBuild;
-	private uint m_longestPackName;
+	private uint m_longestPackLen;
 
 	// per package logs to track if cmd line has changed and module dependencies
 	private EdgeLog[string] m_edgeLogs;
@@ -54,7 +54,7 @@ class BuildGraphGenerator : ProjectGenerator
 		m_readyFirst = null;
 		m_readyLast = null;
 		m_numToBuild = 0;
-		m_longestPackName = 0;
+		m_longestPackLen = 0;
 		m_edgeLogs = null;
 
 		enforce(!settings.rdmd, "RDMD not supported for graph based builds");
@@ -71,7 +71,7 @@ class BuildGraphGenerator : ProjectGenerator
 			auto pn = target in targetNodes;
 			if (pn) return *pn;
 
-			m_longestPackName = max(m_longestPackName, cast(uint)target.length);
+			m_longestPackLen = max(m_longestPackLen, cast(uint)target.length);
 
 			const ti = targets[target];
 
@@ -388,83 +388,28 @@ class BuildGraphGenerator : ProjectGenerator
 		node.mustBuild = mustBuild;
 		return mustBuild;
 	}
-
 	private void build(in uint maxJobs)
 	{
 		import core.time : dur;
 		import std.concurrency : receive, receiveTimeout;
 		import std.format : format;
-		import std.stdio : stdout;
-
-		int numLen(in int num) {
-			auto cmp = 10;
-			auto res = 1;
-			while (cmp <= num) {
-				cmp *= 10;
-				res += 1;
-			}
-			return res;
-		}
-		string spaces(in size_t numSpaces)
-		{
-			import std.array : replicate;
-			return replicate(" ", numSpaces);
-		}
-
-		enum progLogLevel = LogLevel.info;
-
-		const maxLen = numLen(m_numToBuild);
-		int num=1;
-		size_t previousLen;
-		bool consoleLocked;
-		string progBuffer;
-		string[] logBuffer;
-
-		void printProgress(in string packName, in string desc)
-		{
-			if (getLogLevel() < progLogLevel) return;
-
-			const numStr = format("%s%s", spaces(maxLen-numLen(num)), num++);
-			const packStr = format("%s%s", packName, spaces(m_longestPackName-cast(uint)packName.length));
-
-			enum printSameLine = true;
-			static if (printSameLine) {
-				enum fmt = "\r[ %s/%s %s ] %s%s";
-			} else {
-				enum fmt = "[ %s/%s %s ] %s%s\n";
-			}
-
-			const msg = format(fmt, numStr, m_numToBuild, packStr, desc,
-				spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
-
-			if (!consoleLocked) {
-				stdout.write(msg);
-				stdout.flush();
-			}
-			else {
-				progBuffer = msg;
-			}
-
-			previousLen = desc.length;
-		}
 
 		uint jobs;
 
-		scope(exit) log(progLogLevel, ""); // log new line
+		auto console = new BuildConsole(m_numToBuild, m_longestPackLen);
+		scope(exit) console.close();
 
 		while (m_readyFirst) {
 
 			auto e = m_readyFirst;
 
 			while (e && jobs < maxJobs) {
-				if (!e.inProgress && (!consoleLocked || !e.locksConsole)) {
+				if (!e.inProgress && (!console.locked || !e.locksConsole)) {
 					jobs += e.jobs;
-					printProgress(e.pack.name, e.desc);
+					console.printProgress(e.pack.name, e.desc);
 					e.process();
-					if (e.locksConsole) {
-						consoleLocked = true;
-						log(progLogLevel, "");
-					}
+					if (e.locksConsole)
+						console.lock();
 				}
 				e = e.readyNext;
 			}
@@ -486,32 +431,15 @@ class BuildGraphGenerator : ProjectGenerator
 						}
 					}
 				}
-				const unlockConsole = consoleLocked && edge.locksConsole;
-				if (unlockConsole) {
-					consoleLocked = false;
-					foreach (lb; logBuffer) {
-						log(progLogLevel, "%s", lb);
-					}
-					logBuffer = null;
-				}
 				if (ec.output.length) {
 					const msg = format(
 						"\nmessage from %s - %s:\n%s\n%s",
 						edge.pack.name, edge.desc, ec.cmd, ec.output
 					);
-					if (consoleLocked) {
-						logBuffer ~= msg;
-					}
-					else {
-						log(progLogLevel, "%s", msg);
-					}
+					console.printMessage(msg);
 				}
-				if (unlockConsole && progBuffer) {
-					if (getLogLevel() < progLogLevel) {
-						stdout.write(progBuffer);
-						stdout.flush();
-					}
-					progBuffer = null;
+				if (console.locked && edge.locksConsole) {
+					console.unlock();
 				}
 			}
 
@@ -1261,4 +1189,122 @@ void runTarget(string exePath, in BuildSettings buildsettings, string[] runArgs,
 		auto result = pid.wait();
 		enforce(result == 0, "Program exited with code "~to!string(result));
 	}
+}
+
+class BuildConsole
+{
+	private enum progLogLevel = LogLevel.info;
+	private enum printSameLine = true;
+
+	private bool locked;
+	private bool hadNL = true;
+	private uint num = 1;
+	private uint numToBuild;
+	private uint longestPackLen;
+	private uint maxNumLen;
+	private size_t previousLen;
+	private string progBuf;
+	private string[] msgBuf;
+
+
+	this(in uint numToBuild, in uint longestPackLen)
+	{
+		this.numToBuild = numToBuild;
+		this.longestPackLen = longestPackLen;
+		maxNumLen = numLen(numToBuild);
+	}
+
+	void close()
+	{
+		ensureNL();
+	}
+
+	void lock() in (!locked)
+	{
+		locked = true;
+		ensureNL();
+	}
+
+	void unlock() in (locked)
+	{
+		import std.stdio : stdout;
+
+		locked = false;
+		ensureNL();
+		foreach (m; msgBuf) {
+			log(progLogLevel, m);
+		}
+		msgBuf = null;
+		if (progBuf) {
+			stdout.write(progBuf);
+			stdout.flush();
+			static if (printSameLine) hadNL = false;
+		}
+		progBuf = null;
+	}
+
+	void printProgress(in string packName, in string desc)
+	{
+		import std.format : format;
+		import std.stdio : stdout;
+
+		if (getLogLevel() < progLogLevel) return;
+
+		const numStr = format("%s%s", spaces(maxNumLen-numLen(num)), num++);
+		const packStr = format("%s%s", packName, spaces(longestPackLen-cast(uint)packName.length));
+
+		static if (printSameLine) {
+			enum fmt = "\r[ %s/%s %s ] %s%s";
+		} else {
+			enum fmt = "[ %s/%s %s ] %s%s\n";
+		}
+
+		const msg = format(fmt, numStr, numToBuild, packStr, desc,
+			spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
+
+		if (!locked) {
+			stdout.write(msg);
+			stdout.flush();
+			static if (printSameLine) hadNL = false;
+		} else {
+			progBuf = msg;
+		}
+
+		previousLen = desc.length;
+	}
+
+	void printMessage(in string msg)
+	{
+		if (locked) {
+			msgBuf ~= msg;
+		}
+		else {
+			log(progLogLevel, msg);
+			hadNL = true;
+		}
+	}
+
+	private void ensureNL()
+	{
+		if (!hadNL) {
+			log(progLogLevel, "");
+			hadNL = true;
+		}
+	}
+
+	private static int numLen(in int num) pure {
+		auto cmp = 10;
+		auto res = 1;
+		while (cmp <= num) {
+			cmp *= 10;
+			res += 1;
+		}
+		return res;
+	}
+	private static string spaces(in size_t numSpaces) pure
+	{
+		import std.array : replicate;
+		return replicate(" ", numSpaces);
+	}
+
 }
