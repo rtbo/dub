@@ -5,6 +5,8 @@ version(DubUseGraphBuild):
 
 import dub.internal.vibecompat.core.log;
 
+/// Retrieve dependencies of the module pointed to by filename.
+/// The dependencies returned are paths to the module source files.
 string[] moduleDeps(in string filename, in string[] importPaths)
 {
     auto mods = importedLocalModules(filename);
@@ -14,6 +16,7 @@ string[] moduleDeps(in string filename, in string[] importPaths)
     return mods;
 }
 
+/// Map a module name to its source file path
 string findDep (in string mod, in string[] importPaths)
 {
     import std.algorithm : splitter;
