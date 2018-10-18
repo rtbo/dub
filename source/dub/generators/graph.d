@@ -1195,16 +1195,15 @@ void runTarget(string exePath, in BuildSettings buildsettings, string[] runArgs,
 
 class BuildConsole
 {
-	private enum progLogLevel = LogLevel.info;
-	private enum printSameLine = true;
+	private enum logLevel = LogLevel.info;
 
+	private bool smartTerm;
 	private bool locked;
 	private bool hadNL = true;
 	private uint num = 1;
 	private uint numToBuild;
 	private uint longestPackLen;
 	private uint maxNumLen;
-	private size_t previousLen;
 	private string progBuf;
 	private string[] msgBuf;
 
@@ -1214,6 +1213,7 @@ class BuildConsole
 		this.numToBuild = numToBuild;
 		this.longestPackLen = longestPackLen;
 		maxNumLen = numLen(numToBuild);
+		smartTerm = isSmartTerm();
 	}
 
 	void close()
@@ -1234,45 +1234,30 @@ class BuildConsole
 		locked = false;
 		ensureNL();
 		foreach (m; msgBuf) {
-			log(progLogLevel, m);
+			log(logLevel, m);
 		}
 		msgBuf = null;
 		if (progBuf) {
-			stdout.write(progBuf);
-			stdout.flush();
-			static if (printSameLine) hadNL = false;
+			printProgLine(progBuf);
+			progBuf = null;
 		}
-		progBuf = null;
 	}
 
 	void printProgress(in string packName, in string desc)
 	{
 		import std.format : format;
-		import std.stdio : stdout;
 
-		if (getLogLevel() < progLogLevel) return;
+		if (getLogLevel() < logLevel) return;
 
 		const numStr = format("%s%s", spaces(maxNumLen-numLen(num)), num++);
 		const packStr = format("%s%s", packName, spaces(longestPackLen-cast(uint)packName.length));
-
-		static if (printSameLine) {
-			enum fmt = "\r[ %s/%s %s ] %s%s";
-		} else {
-			enum fmt = "[ %s/%s %s ] %s%s\n";
-		}
-
-		const msg = format(fmt, numStr, numToBuild, packStr, desc,
-			spaces(previousLen < desc.length ? 0 : previousLen - desc.length));
+		const msg = format("[ %s/%s %s ] %s", numStr, numToBuild, packStr, desc);
 
 		if (!locked) {
-			stdout.write(msg);
-			stdout.flush();
-			static if (printSameLine) hadNL = false;
+			printProgLine(msg);
 		} else {
 			progBuf = msg;
 		}
-
-		previousLen = desc.length;
 	}
 
 	void printMessage(in string msg)
@@ -1281,7 +1266,7 @@ class BuildConsole
 			msgBuf ~= msg;
 		}
 		else {
-			log(progLogLevel, msg);
+			log(logLevel, msg);
 			hadNL = true;
 		}
 	}
@@ -1289,7 +1274,26 @@ class BuildConsole
 	private void ensureNL()
 	{
 		if (!hadNL) {
-			log(progLogLevel, "");
+			log(logLevel, "");
+			hadNL = true;
+		}
+	}
+
+	private void printProgLine(string line)
+	{
+		import std.stdio : stdout;
+
+		if (smartTerm) {
+			const width = termWidth();
+			if (width < line.length) {
+				line = line[0 .. width-4] ~ " ...";
+			}
+			stdout.writef("\r%s\x1B[K", line); // clears to end of line
+			stdout.flush();
+			hadNL = false;
+		}
+		else {
+			stdout.writeln(line);
 			hadNL = true;
 		}
 	}
@@ -1309,4 +1313,30 @@ class BuildConsole
 		return replicate(" ", numSpaces);
 	}
 
+}
+
+bool isSmartTerm()
+{
+	version(Posix) {
+		import core.sys.posix.unistd : isatty;
+		import std.process : environment;
+
+		const term = environment.get("TERM");
+		return isatty(1) && term != "dumb";
+	}
+	else {
+		static assert(false, "not implemented");
+	}
+}
+
+int termWidth()
+{
+	version(Posix) {
+		import core.sys.posix.sys.ioctl : ioctl, TIOCGWINSZ, winsize;
+		import std.exception : errnoEnforce;
+
+		winsize sz;
+		errnoEnforce(ioctl(1, TIOCGWINSZ, &sz) == 0);
+		return sz.ws_col;
+	}
 }
