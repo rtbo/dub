@@ -171,9 +171,9 @@ private:
 	static bool pathMatch(string path, string pattern)
 	{
 		import std.functional : memoize;
-		
+
 		alias nativePath = memoize!((string stringPath) => NativePath(stringPath));
-			
+
 		return nativePath(path) == nativePath(pattern) || globMatch(path, pattern);
 	}
 
@@ -304,7 +304,8 @@ enum BuildOption {
 
 	// for internal usage
 	_docs = 1<<24,                // Write ddoc to docs
-	_ddox = 1<<25                 // Compile docs.json
+	_ddox = 1<<25,                // Compile docs.json
+	_color = 1<<26,               // Force color output (-color=on)
 }
 
 	struct BuildOptions {

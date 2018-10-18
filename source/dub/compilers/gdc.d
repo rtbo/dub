@@ -49,6 +49,7 @@ class GDCCompiler : Compiler {
 
 		tuple(BuildOption._docs, ["-fdoc-dir=docs"]),
 		tuple(BuildOption._ddox, ["-fXf=docs.json", "-fdoc-file=__dummy.html"]),
+		//tuple(BuildOption._color, ["-?"]),
 	];
 
 	private string versionCache;

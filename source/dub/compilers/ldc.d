@@ -50,6 +50,7 @@ class LDCCompiler : Compiler {
 
 		tuple(BuildOption._docs, ["-Dd=docs"]),
 		tuple(BuildOption._ddox, ["-Xf=docs.json", "-Dd=__dummy_docs"]),
+		tuple(BuildOption._color, ["-enable-color"]),
 	];
 
 	private string versionCache;
@@ -254,12 +255,29 @@ class LDCCompiler : Compiler {
 
 	CompilerInvocation invocation(in BuildSettings settings, in BuildPlatform platform, in string depfile)
 	{
-		return CompilerInvocation.init;
+		import std.exception  : assumeUnique;
+		import std.format : format;
+		import std.range : only;
+
+		const(string)[] args = [ platform.compilerBinary ] ~ settings.dflags;
+		if (platform.frontendVersion >= 2066) args ~= "-vcolumns";
+
+		return CompilerInvocation( assumeUnique(args),  null, null );
 	}
 
 	CompilerInvocation linkerInvocation(in BuildSettings settings, in BuildPlatform platform, in string[] objects)
 	{
-		return CompilerInvocation.init;
+		import std.exception : assumeUnique;
+
+		auto tpath = NativePath(settings.targetPath) ~ getTargetFileName(settings, platform);
+		auto args = [ platform.compilerBinary, "-of"~tpath.toNativeString() ];
+		args ~= objects;
+		args ~= settings.sourceFiles;
+		//version(linux) args ~= "-L--no-as-needed"; // avoids linker errors due to libraries being specified in the wrong order by DMD
+		args ~= lflagsToDFlags(settings.lflags);
+		args ~= settings.dflags.filter!(f => isLinkerDFlag(f)).array;
+
+		return CompilerInvocation( assumeUnique(args), null );
 	}
 
 	private auto escapeArgs(in string[] args)
@@ -290,5 +308,16 @@ class LDCCompiler : Compiler {
 
 		compiler_coff_map[platform.compilerBinary] = ret;
 		return ret;
+	}
+
+	private static bool isLinkerDFlag(string arg)
+	{
+		switch (arg) {
+			default:
+				if (arg.startsWith("-defaultlib=")) return true;
+				return false;
+			case "-g", "-gc", "-m32", "-m64", "-shared", "-lib", "-m32mscoff":
+				return true;
+		}
 	}
 }

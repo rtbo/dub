@@ -50,6 +50,7 @@ class DMDCompiler : Compiler {
 
 		tuple(BuildOption._docs, ["-Dddocs"]),
 		tuple(BuildOption._ddox, ["-Xfdocs.json", "-Df__dummy.html"]),
+		tuple(BuildOption._color, ["-color=on"]),
 	];
 	private string versionCache;
 
