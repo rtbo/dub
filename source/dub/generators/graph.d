@@ -851,6 +851,7 @@ class CompileEdge : Edge
 		cbs.lflags = null;
 		cbs.sourceFiles = [ src ];
 		cbs.targetType = TargetType.object;
+		cbs.addOptions(BuildOption._color);
 		gs.compiler.prepareBuildSettings(cbs, BuildSetting.commandLine);
 		gs.compiler.setTarget(cbs, gs.platform, obj);
 		invocation = gs.compiler.invocation(cbs, gs.platform);
@@ -946,6 +947,7 @@ class LinkEdge : Edge
 				bs.targetType == TargetType.library;
 		BuildSettings lbs = bs;
 		lbs.sourceFiles = isStaticLib ? [] : bs.sourceFiles.filter!(f => f.isLinkerFile()).array;
+		lbs.addOptions(BuildOption._color);
 		gs.compiler.setTarget(lbs, gs.platform);
 		gs.compiler.prepareBuildSettings(lbs, BuildSetting.commandLineSeparate|BuildSetting.sourceFiles);
 		invocation = gs.compiler.linkerInvocation(lbs, gs.platform, objs);
