@@ -875,18 +875,15 @@ class CompileEdge : Edge
 				int code;
 				string output;
 				const cmd = ci.args.join(" ");
-				if (ci.depfile.length) {
-					mkdirRecurse(dirName(ci.depfile));
-				}
 				if (invoke(ci, code, output)) {
 					// would normally use dmd -deps option here, but the tests I did show it really buggy:
 					//  - ~3000 lines exported for each file
-					//  - builds about 10x slower (may be due to IO or to my code processing of the too many lines)
+					//  - builds about 10x slower
 					//  - prints lines for every module without possibility to filter out core and std
-					//  - likely perform recursive analysis, which is not needed here
+					//  - perform recursive analysis, which is not needed here
 					//  - occasional ICE
 					// so I fallback on libdparse based import parsing
-					import dub.generators.imports : moduleDeps;
+					import dub.internal.imports : moduleDeps;
 					import std.exception : assumeUnique;
 
 					immutable deps = assumeUnique(moduleDeps(src, importPaths));

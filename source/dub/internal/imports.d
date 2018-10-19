@@ -1,5 +1,5 @@
 /// helper module for parsing import declarations and find module dependencies.
-module dub.generators.imports;
+module dub.internal.imports;
 
 version(DubUseGraphBuild):
 
