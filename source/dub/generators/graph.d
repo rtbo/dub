@@ -1200,6 +1200,13 @@ class BuildConsole
 {
 	private enum logLevel = LogLevel.info;
 
+	version(Windows) {
+		import core.sys.windows.windows : CHAR_INFO, HANDLE;
+
+		private HANDLE hdl;
+		private CHAR_INFO[] charData;
+	}
+
 	private bool smartTerm;
 	private bool locked;
 	private bool hadNL = true;
@@ -1210,13 +1217,33 @@ class BuildConsole
 	private string progBuf;
 	private string[] msgBuf;
 
-
 	this(in uint numToBuild, in uint longestPackLen)
 	{
+		version(Windows) {
+			import core.stdc.stdio : setvbuf, stdout, _IONBF;
+			import core.sys.windows.windows : 
+				CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, 
+				GetStdHandle, STD_OUTPUT_HANDLE;
+
+			setvbuf(stdout, null, _IONBF, 0);
+			this.hdl = GetStdHandle(STD_OUTPUT_HANDLE);
+			CONSOLE_SCREEN_BUFFER_INFO csbi;
+			this.smartTerm = cast(bool)GetConsoleScreenBufferInfo(hdl, &csbi);
+		}
+		else version (Posix) {
+			import core.sys.posix.unistd : isatty;
+			import std.process : environment;
+
+			const term = environment.get("TERM");
+			this.smartTerm = isatty(1) && term != "dumb";
+		}
+		else {
+			static assert(false);
+		}
 		this.numToBuild = numToBuild;
 		this.longestPackLen = longestPackLen;
-		maxNumLen = numLen(numToBuild);
-		smartTerm = isSmartTerm();
+		this.maxNumLen = numLen(numToBuild);
+
 	}
 
 	void close()
@@ -1287,12 +1314,65 @@ class BuildConsole
 		import std.stdio : stdout;
 
 		if (smartTerm) {
-			const width = termWidth();
-			if (width < line.length) {
-				line = line[0 .. width-4] ~ " ...";
+			version (Windows) {
+				import core.sys.windows.windows :
+						CONSOLE_SCREEN_BUFFER_INFO, COORD,
+						GetConsoleScreenBufferInfo, SHORT,
+						SMALL_RECT, WriteConsoleOutputA;
+
+
+				CONSOLE_SCREEN_BUFFER_INFO csbi;
+				GetConsoleScreenBufferInfo(hdl, &csbi);
+				const width = cast(int)csbi.dwSize.X;
+
+				static if (true) {
+					// the following code writes a line to stdout without
+					// moving the cursor position.
+					// Careful about using the 'A' or 'W' version of WriteConsoleOutput. 
+					// Not the same CHAR_INFO member is to be written.
+					if (width < line.length) {
+						line = line[0 .. width-4] ~ " ...";
+					}
+					const bufSize = COORD(width, 1);
+					const zero = COORD(0, 0);
+					auto target = SMALL_RECT(
+						csbi.dwCursorPosition.X, csbi.dwCursorPosition.Y,
+						cast(SHORT)(csbi.dwCursorPosition.X + width - 1),
+						csbi.dwCursorPosition.Y
+					);
+					charData.length = width;
+					foreach (i; 0 .. width) {
+						charData[i].Attributes = csbi.wAttributes;
+						charData[i].Char.AsciiChar = i < line.length ? line[i] : ' ';
+					}
+					stdout.write("\r");
+					WriteConsoleOutputA(hdl, &charData[0], bufSize, zero, &target);
+				}
+				else {
+					// width must be strictly higher than line length.
+					// if equal, a new line is printed
+					if (width <= line.length) {
+						line = line[0 .. width-5] ~ " ...";
+					}
+					assert(width > line.length);
+
+					stdout.writef("\r%s%s", line, spaces(width - cast(int)line.length - 1));
+				}
 			}
-			stdout.writef("\r%s\x1B[K", line); // clears to end of line
-			stdout.flush();
+			else version (Posix) {
+				import core.sys.posix.sys.ioctl : ioctl, TIOCGWINSZ, winsize;
+				import std.exception : errnoEnforce;
+
+				winsize sz;
+				errnoEnforce(ioctl(1, TIOCGWINSZ, &sz) == 0);
+				const width = cast(int)sz.ws_col;
+				if (width < line.length) {
+					line = line[0 .. width-4] ~ " ...";
+				}
+				stdout.writef("\r%s\x1B[K", line); // clears to end of line
+				stdout.flush();
+			}
+			else { static assert(false); }
 			hadNL = false;
 		}
 		else {
@@ -1316,30 +1396,4 @@ class BuildConsole
 		return replicate(" ", numSpaces);
 	}
 
-}
-
-bool isSmartTerm()
-{
-	version(Posix) {
-		import core.sys.posix.unistd : isatty;
-		import std.process : environment;
-
-		const term = environment.get("TERM");
-		return isatty(1) && term != "dumb";
-	}
-	else {
-		static assert(false, "not implemented");
-	}
-}
-
-int termWidth()
-{
-	version(Posix) {
-		import core.sys.posix.sys.ioctl : ioctl, TIOCGWINSZ, winsize;
-		import std.exception : errnoEnforce;
-
-		winsize sz;
-		errnoEnforce(ioctl(1, TIOCGWINSZ, &sz) == 0);
-		return sz.ws_col;
-	}
 }
