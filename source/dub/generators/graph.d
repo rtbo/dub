@@ -283,8 +283,14 @@ class BuildGraphGenerator : ProjectGenerator
 		string[] objFiles;
 
 		foreach (f; bs.sourceFiles.filter!(f => !f.isLinkerFile())) {
+
 			const srcRel = relativePath(f, absolutePath(packPath, cwd));
-			const objPath = buildNormalizedPath(buildDir, srcRel)~".o";
+			BuildSettings cbs = bs;
+			cbs.targetName = srcRel;
+			cbs.targetType = TargetType.object;
+			const objRelPath = gs.compiler.getTargetFileName(cbs, gs.platform);
+			const objPath = buildNormalizedPath(buildDir, objRelPath);
+
 			auto src = new FileNode(this, packName, f);
 			auto obj = new FileNode(this, packName, objPath);
 			auto edge = new CompileEdge(this, ti.pack, gs, bs,
